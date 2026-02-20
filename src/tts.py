@@ -200,6 +200,7 @@ Examples:
             'output_path': str(output_dir),
             'file_prefix': file_prefix,
             'speed': args.speed,  # Apply speed to both modes
+            'join_audio': True,  # Merge all audio segments into one file (no _000 suffix)
             'verbose': args.verbose
         }
 
