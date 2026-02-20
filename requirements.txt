@@ -1,0 +1,10 @@
+# MLX AI Tools - Python Dependencies
+
+# Ollama Python client for LLM, OCR, Translation, and Vision models
+ollama>=0.4.0
+
+# MLX Audio for ASR and TTS models (already installed, locking version)
+mlx-audio==0.3.1
+
+# Image processing library for OCR and image analysis
+Pillow>=10.0.0
