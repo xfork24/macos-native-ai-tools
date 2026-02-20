@@ -25,9 +25,15 @@ env/
 .DS_Store
 Thumbs.db
 
-# Project specific
-input/
-output/
+# Project specific - keep directories but ignore contents
+input/*
+output/*
+models/*
+!input/.gitkeep
+!output/.gitkeep
+!models/.gitkeep
+
+# Claude
 .claude/
 
 # Node (if any)

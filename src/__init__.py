@@ -8,6 +8,7 @@ A collection of Python scripts integrating local AI models for:
 - LLM Chat
 - ASR (Automatic Speech Recognition)
 - TTS (Text-to-Speech)
+- Image Generation (Stable Diffusion 1.5)
 """
 
 __version__ = "1.0.0"

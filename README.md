@@ -1,6 +1,6 @@
 # MLX AI 工具集
 
-一套整合本地部署 AI 模型的 Python 脚本工具，提供 OCR、翻译、图片分析、LLM 聊天、ASR 和 TTS 六大功能。
+一套整合本地部署 AI 模型的 Python 脚本工具，提供 OCR、翻译、图片分析、LLM 聊天、ASR、TTS 和图片生成七大功能。
 
 ## 功能概览
 
@@ -12,11 +12,14 @@
 | LLM 聊天 | `src/chat.py` | Qwen3:8b | Ollama |
 | 语音转文字 | `src/asr.py` | Qwen3-ASR-1.7B-8bit | MLX |
 | 文字转语音 | `src/tts.py` | Qwen3-TTS-1.7B | MLX |
+| 图片生成 | `src/sd15.py` | Stable Diffusion 1.5 | PyTorch/Diffusers |
 
 ## 环境要求
 
 - Python 3.13.11
 - MLX Audio 0.3.1
+- PyTorch 2.10.0
+- Diffusers
 - Ollama 服务运行在 localhost:11434
 
 ## 安装
@@ -32,6 +35,16 @@ source .venv/bin/activate
 
 ```bash
 uv pip install -r requirements.txt
+```
+
+### 3. 下载 Stable Diffusion 1.5 模型（可选）
+
+如需使用图片生成功能，请下载 SD1.5 模型：
+
+```bash
+# 下载模型文件到 models 目录
+# 推荐使用: v1-5-pruned-emaonly-fp16.safetensors
+# 下载地址: https://huggingface.co/stable-diffusion-v1-5
 ```
 
 ## 使用方法
@@ -140,7 +153,7 @@ python src/tts.py input.txt -v Vivian -o my_output
 预设音色参数：
 - `-v/--voice`: 音色名称（Vivian、Aiden 等）
 - `-l/--lang-code`: 语言代码（cn/en/auto）
-- `-s/--speed`: 语速（0.5-3.0，默认 1.0）
+- `-s/--speed`: 语速（0.5-3.0，默认 1.3）
 - `--instruct`: 合成指令
 
 #### 语音克隆模式
@@ -158,6 +171,47 @@ python src/tts.py input.txt --clone --ref-audio ref.wav --ref-text "参考文本
 - `--ref-audio`: 参考音频文件路径
 - `--ref-text`: 参考文本（必须与参考音频内容匹配）
 
+### 图片生成 (Stable Diffusion 1.5)
+
+使用 Stable Diffusion 1.5 生成图片：
+
+```bash
+# 基本用法
+python src/sd15.py "a serene mountain landscape, high resolution, digital art"
+
+# 指定输出文件
+python src/sd15.py "a cat sitting on a table" -o my_cat.png
+
+# 带负面提示词和自定义步数
+python src/sd15.py "a beautiful sunset" --negative "blurry, low quality" -s 30
+
+# 自定义尺寸和引导强度
+python src/sd15.py "portrait of a woman" --width 768 --height 768 --guidance 8.5
+
+# 固定种子以获得可复现结果
+python src/sd15.py "a futuristic city" --seed 42
+
+# 生成多张图片
+python src/sd15.py "a red rose" -n 4
+```
+
+图片生成参数：
+- `prompt`: 提示词（必需）
+- `-n, --negative`: 负面提示词（默认空）
+- `-o, --output`: 输出文件前缀（默认 sd15_output）
+- `--output-dir`: 输出目录（默认 ./output）
+- `-m, --model`: 模型文件路径（默认 models/v1-5-pruned-emaonly-fp16.safetensors）
+- `-s, --steps`: 去噪步数（默认 20）
+- `--width`: 图片宽度（默认 512，必须为 64 的倍数）
+- `--height`: 图片高度（默认 512，必须为 64 的倍数）
+- `-g, --guidance`: 提示词引导强度（默认 7.5）
+- `--seed`: 随机种子（用于可复现）
+- `--num-images`: 生成图片数量（默认 1）
+- `--dtype`: 数据类型 float32/float16（默认 float16）
+- `--safety`: 启用安全检查器（默认禁用）
+
+注意：图片生成功能使用 MPS 加速，需要 Apple Silicon 芯片和足够的内存。
+
 ## 项目结构
 
 ```
@@ -171,9 +225,11 @@ python src/tts.py input.txt --clone --ref-audio ref.wav --ref-text "参考文本
 │   ├── analyze_image.py     # 图片分析脚本
 │   ├── chat.py              # LLM 聊天脚本
 │   ├── asr.py               # 语音转文字脚本
-│   └── tts.py               # 文字转语音脚本
+│   ├── tts.py               # 文字转语音脚本
+│   └── sd15.py              # 图片生成脚本（SD1.5）
 ├── input/                    # 输入文件目录
 ├── output/                   # 输出文件目录
+├── models/                   # 模型文件目录
 ├── backup/                   # 备份和示例代码
 ├── requirements.txt          # Python 依赖列表
 └── README.md                 # 本文件
@@ -197,9 +253,17 @@ MLX 相关脚本（ASR、TTS）支持：
 
 ## 依赖说明
 
+### Ollama 相关
 - **ollama** (>=0.4.0): Ollama Python 客户端，用于与 Ollama 服务通信
+
+### MLX 相关
 - **mlx-audio** (==0.3.1): MLX Audio 框架，用于 ASR 和 TTS 功能
 - **Pillow** (>=10.0.0): 图像处理库，用于 OCR 和图片分析
+
+### 图片生成相关
+- **torch** (>=2.0.0): PyTorch 深度学习框架
+- **diffusers**: Diffusers 库，用于 Stable Diffusion 推理
+- **safetensors**: 安全的张子序列化格式
 
 ## 故障排除
 
@@ -226,6 +290,17 @@ ollama pull Qwen3:8b
 
 MLX 模型会在首次使用时自动下载。
 
+### SD1.5 生成纯黑图片
+
+如果生成的图片是纯黑色的：
+
+1. 确认模型文件路径正确
+2. 尝试使用 float32 而不是 float16：
+   ```bash
+   python src/sd15.py "a landscape" --dtype float32
+   ```
+3. 减少 steps 数量或降低图片分辨率
+
 ### 虚拟环境问题
 
 如果遇到依赖问题：
@@ -240,6 +315,7 @@ uv pip install -r requirements.txt --force-reinstall
 - OCR 示例：`backup/qwen3-asr.py`
 - TTS 预设音色示例：`backup/qwen3-tts-custom-voice.py`
 - TTS 语音克隆示例：`backup/qwen3-tts-voice-clone.py`
+- SD1.5 示例：`backup/sd1.5-inference-single.py`
 
 ## 许可证
 
