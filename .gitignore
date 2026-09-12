@@ -39,3 +39,8 @@ models/*
 # Node (if any)
 node_modules/
 package-lock.json
+
+# other files
+rag_architecture.png
+test_assets/
+tests/
