@@ -1254,10 +1254,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  -> {report}")
 
     log_path = build_dir / "failures.log"
+    log_modes = list(modes)
+    if "mathml" not in log_modes:
+        # A png/svg-only run must not lose the mathml section of the log:
+        # parse the mathml epub built by an earlier run in this directory.
+        existing = out_dir / f"{md_path.stem}.mathml.epub"
+        if existing.exists():
+            mathml_epub = existing
+            log_modes.append("mathml")
     write_failure_log(
         log_path,
         source_name=md_path.name,
-        modes=modes,
+        modes=log_modes,
         text=text,
         mathml_epub=mathml_epub,
         svg_cache=svg_cache,
