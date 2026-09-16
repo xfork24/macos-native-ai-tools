@@ -1,0 +1,31 @@
+{
+  "md_glob": "*.md",
+  "origin_pdf_glob": "*_origin.pdf",
+  "colophon_enabled": true,
+  "colophon_md": "# 关于本电子书\n\n本书由 OCR 工具从扫描版自动转换生成（2026-09-16），公式与文字可能存在识别错误，仅供个人学习使用。\n",
+  "chapter_regex": "^#+\\s*第[一二三四五六七八九十]+章",
+  "promote_h1_patterns": [
+    "^## (第[一二三四五六七八九十]+章.*)",
+    "^## (部分习题答案与提示)\\s*$",
+    "^## (索引)\\s*$"
+  ],
+  "normalize_h1_space": "^# (第[一二三四五六七八九十]+章)(\\S)",
+  "keep_h2_prefix": "## §",
+  "junk_h2_patterns": [
+    "^（?\\(?\\d+\\)?\\)?\\s*\\S",
+    "^例\\s?\\d",
+    "^\\d+\\.\\s",
+    "^(目录|I索引)\\s*$",
+    "^[A-Z]\\s*$"
+  ],
+  "junk_h2_contains_html_tag": true,
+  "page_label_regex": "^\\s*印刷页\\s*\\d+\\s*$",
+  "expected": {
+    "h1_count": 11,
+    "h2_section_count": 32,
+    "display_math": 2172,
+    "inline_math": 6930,
+    "nav_top_level": 11,
+    "nav_leaves": 43
+  }
+}

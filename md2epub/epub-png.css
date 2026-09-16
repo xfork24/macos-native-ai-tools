@@ -1,0 +1,49 @@
+/* 数学分析 epub — png 模式专用样式。
+   与 epub.css 的关键区别：没有任何裸 `img` 选择器。
+   iReader 等引擎不支持 ex 单位，会丢弃 math img 的 style 声明，级联若落到
+   `img{height:auto}` 就会回到位图固有尺寸（过大）。因此一切 img 规则都必须
+   类作用域，且绝不给公式 img 写 height。 */
+
+html { font-size: 100%; }
+
+body {
+  line-height: 1.75;
+  margin: 0 5%;
+  font-family: "Songti SC", "Noto Serif CJK SC", "Source Han Serif SC",
+               "SRFSD+", serif;
+  text-align: justify;
+}
+
+p { margin: 0 0 .2em 0; text-indent: 2em; }
+
+h1, h2, h3, h4 {
+  font-family: "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC",
+               sans-serif;
+  font-weight: 600;
+  text-indent: 0;
+  page-break-after: avoid;
+  text-align: left;
+}
+h1 { font-size: 1.5em; margin: 2em 0 1em; text-align: center; }
+h2 { font-size: 1.25em; margin: 1.6em 0 .8em; }
+h3 { font-size: 1.08em; margin: 1.2em 0 .6em; }
+h4 { font-size: 1em; margin: 1em 0 .5em; }
+
+/* 插图（content images 显式挂 figure-img 类） */
+img.figure-img { display: block; margin: 1em auto; max-width: 100%; height: auto; }
+
+/* 公式位图：尺寸完全交给 width/height 属性（ex 单位的 style 只是
+   CSS 能力完整阅读器上的增强，被 iReader 丢弃也无害）。
+   注意：绝不给公式 img 写 max-width/width —— iReader 会把
+   max-width:100% 当 width:100% 处理，行间公式被拉伸到整屏宽。 */
+img.math-inline { display: inline; margin: 0; text-indent: 0; }
+.math-display { text-align: center; margin: 1em 0; text-indent: 0; }
+
+/* 单个 HTML 表格 */
+table { border-collapse: collapse; margin: 1em auto; font-size: .95em; }
+th, td { border: 1px solid currentColor; padding: .3em .6em; }
+caption { caption-side: top; font-size: .9em; text-indent: 0; }
+
+code.math-raw { font-size: .85em; opacity: .8; }
+
+sub, sup { font-size: .72em; line-height: 0; }

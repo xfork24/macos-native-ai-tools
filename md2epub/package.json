@@ -1,0 +1,9 @@
+{
+  "name": "md2epub-math-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local MathJax SVG renderer for the md2epub converter (svg math mode)",
+  "dependencies": {
+    "mathjax-full": "^3.2.2"
+  }
+}

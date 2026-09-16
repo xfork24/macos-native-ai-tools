@@ -1,0 +1,67 @@
+/* 数学分析 epub — shared stylesheet for mathml & svg modes.
+   Night-mode safe: no color/background declarations anywhere;
+   colors inherit from the reader theme, borders use currentColor. */
+
+html { font-size: 100%; }
+
+body {
+  line-height: 1.75;
+  margin: 0 5%;
+  font-family: "Songti SC", "Noto Serif CJK SC", "Source Han Serif SC",
+               "SRFSD+", serif;
+  text-align: justify;
+}
+
+p { margin: 0 0 .2em 0; text-indent: 2em; }
+
+h1, h2, h3, h4 {
+  font-family: "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC",
+               sans-serif;
+  font-weight: 600;
+  text-indent: 0;
+  page-break-after: avoid;
+  text-align: left;
+}
+h1 { font-size: 1.5em; margin: 2em 0 1em; text-align: center; }
+h2 { font-size: 1.25em; margin: 1.6em 0 .8em; }
+h3 { font-size: 1.08em; margin: 1.2em 0 .6em; }
+h4 { font-size: 1em; margin: 1em 0 .5em; }
+
+/* figures */
+img { display: block; margin: 1em auto; max-width: 100%; height: auto; }
+
+/* the single HTML table */
+table { border-collapse: collapse; margin: 1em auto; font-size: .95em; }
+th, td { border: 1px solid currentColor; padding: .3em .6em; }
+caption { caption-side: top; font-size: .9em; text-indent: 0; }
+
+/* — MathML mode — */
+math { font-size: 1.02em; }
+math[display="block"] {
+  display: block;
+  text-align: center;
+  margin: 1em 0;
+  font-size: 1.05em;
+}
+
+/* — SVG mode — */
+.math-display {
+  display: block;
+  text-align: center;
+  margin: 1em 0;
+  text-indent: 0;
+}
+.math-display svg { max-width: 100%; height: auto; }
+.math-inline svg { height: 1.15em; }
+
+/* — PNG mode (readers without inline-SVG support, e.g. iReader) — */
+img.math-inline {
+  display: inline-block;
+  margin: 0;
+  text-indent: 0;
+}
+.math-display img { max-width: 100%; height: auto; }
+
+code.math-raw { font-size: .85em; opacity: .8; }
+
+sub, sup { font-size: .72em; line-height: 0; }
