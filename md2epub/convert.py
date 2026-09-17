@@ -356,6 +356,15 @@ FLIP_DISPLAY_MAX_H_EX = 2.5
 FLIP_DISPLAY_MAX_W_EX = 25.0
 FLIP_INLINE_MIN_H_EX = 3.0
 
+# Display formulas wider than this (ex) carry width ONLY — no height attr, no
+# height CSS. Engines that shrink an oversized image to the text column keep
+# any pinned height and squash it flat (device-verified: ~57ex formulas came
+# out 压扁 on iReader with height pinned both via attr and px CSS). With width
+# alone, every engine derives height from the bitmap's intrinsic ratio, so the
+# aspect survives any shrink; on full-CSS engines the ex width still scales
+# with font size and the ratio-scaled height follows.
+WIDE_WIDTH_ONLY_EX = 40.0
+
 
 def _decide_flips(cache: dict, jobs: dict) -> dict[str, bool]:
     """{key: new_display_flag} for formulas whose rendering style should flip.
@@ -457,6 +466,11 @@ def inject_svg_math(
         # has a real value on engines that ignore ex.
         w_px, h_px = round(w_ex * px_per_ex), round(h_ex * px_per_ex)
         if display:
+            if w_ex > WIDE_WIDTH_ONLY_EX:
+                return (
+                    f'<img src="{src}" width="{w_px}" '
+                    f'style="width:{w_px}px;width:{w_ex}ex" alt="{alt}"/>'
+                )
             # Width AND height in dual units so scaling engines grow both by
             # the same factor (aspect preserved). Never height:auto — it is a
             # valid keyword even on ex-blind engines and would restore the
