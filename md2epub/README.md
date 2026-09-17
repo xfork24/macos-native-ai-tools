@@ -45,8 +45,13 @@ rsvg-convert（png 模式，`brew install librsvg`）、PyYAML + PIL、pdftoppm�
 | 适用 | Apple Books、Thorium、Calibre 等支持 MathML 的阅读器 | 支持外链 SVG 的现代阅读器（Calibre/KOReader） | **不支持 SVG 的引擎（掌阅 iReader 等国产电纸书；Kindle 转换后）——位图是 EPUB 强制支持项，必然能显示** |
 | 缺点 | 绝大多数电纸书不支持（会显示成 LaTeX 原文） | iReader 完全不渲染 SVG（连纯 path 都不画）；Kindle 转换器对 .svg 支持不稳 | 放大有像素；完整 CSS 引擎上尺寸仍随字号缩放 |
 
-三版内容完全相同（同一预处理、同一目录：11 个顶层条目 / 43 个文件）。
-在目标设备上各试一章后选用；iReader 这类设备直接用 png 版。
+三版内容完全相同（同一预处理、同一目录）。在目标设备上各试一章后选用；
+iReader 这类设备直接用 png 版。
+
+终验（2026-09，掌阅 iReader 本地 + 掌阅 KOReader 双端）：mathml 版掌阅
+显示 LaTeX 原文 / KOReader 完美；svg 版掌阅空白 / KOReader 完美；**png 版
+双端基本完美**——画布定标与高公式改排一次校准到位，三版表现与金字塔
+设计完全一致。
 
 实测（2026-09）：iReader 电纸书自带阅读器——mathml 版公式显示为 LaTeX 原文
 （引擎无 MathML 支持，降级读出 annotation）；svg 版公式空白；**测试 3 矩阵
