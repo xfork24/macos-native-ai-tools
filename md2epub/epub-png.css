@@ -37,6 +37,10 @@ img.figure-img { display: block; margin: 1em auto; max-width: 100%; height: auto
    注意：绝不给公式 img 写 max-width/width —— iReader 会把
    max-width:100% 当 width:100% 处理，行间公式被拉伸到整屏宽。 */
 img.math-inline { display: inline; margin: 0; text-indent: 0; }
+/* 行间公式位图：完全复刻插图渲染路径（块级 + 原生 px 属性定尺寸）。
+   绝不写 max-width / height:auto —— iReader 把 max-width:100% 当
+   width:100%（窄公式被拉到全屏宽），height:auto 回到位图固有尺寸。 */
+img.math-display-img { display: block; margin: 0.8em auto; text-indent: 0; }
 .math-display { text-align: center; margin: 1em 0; text-indent: 0; }
 
 /* 单符号公式（x、α、xₙ）按正文文本渲染（位图在弱引擎上有最小高度

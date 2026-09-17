@@ -358,24 +358,24 @@ FLIP_DISPLAY_MAX_W_EX = 25.0
 FLIP_INLINE_MIN_H_EX = 3.0
 
 # png-mode display sizing, decided across imgtest4/5/6 device rounds:
-#   - iReader clamps formula images TALLER than ~44 css px to a single text
-#     line, no matter the markup (pinned/width-only/block-class/figure
-#     replica/wrapper/line-height all failed); 43 px is verified safe.
-#     It also squashes over-wide images (width shrunk, height kept).
-#   - KOReader and full-CSS engines render every variant fine.
-# So the px fallback values (native attrs + px CSS) are scaled to fit a
-# conservative box, while the ex declarations stay true — weak engines never
-# trip their clamps, good engines keep exact font-relative sizing. Tall
-# formulas are additionally split into per-line strips at transparent bands
-# (each strip under the clamp), which lets multi-line math render near full
-# size on weak engines instead of being capped small.
-FALLBACK_BOX_PX = (380, 44)
-SPLIT_ABOVE_EX = 5.4  # tallest device-verified-safe display image (~43 px)
-STRIP_MIN_EX = 1.5  # don't shatter bitmaps into tiny slivers
-STRIP_INK_MAX_FRAC = 0.15  # a cut row may carry at most this fraction of ink
-# Wide display formulas are re-flowed into aligned multi-line LaTeX so each
-# line fits the box width and glyphs render near text size (a 57ex chain
-# width-capped to 380px shows its characters at ~83% of body size).
+#   - iReader clamps INLINE-LEVEL formula images taller than ~44 css px to
+#     a single text line (formula markup variants all failed), but renders
+#     content figures — <p><img class="figure-img"/> with intrinsic px
+#     attrs and no style — at FULL height (the book's 119 figures prove it
+#     on both target readers). Display formulas therefore use exactly the
+#     figure pattern: whole bitmap, intrinsic attrs, block-level.
+#   - iReader also squashes over-wide images (width shrunk, height kept),
+#     so display attrs are capped at DISPLAY_W_CAP_PX.
+#   - KOReader and full-CSS engines render every variant fine; the dual-unit
+#     style keeps ex-true font scaling there.
+# (An earlier approach split tall formula bitmaps into per-line strips to
+# dodge the inline clamp — abandoned: cuts through short intra-construct
+# seams tore fractions/limits apart on real devices.)
+FALLBACK_BOX_PX = (380, 44)  # inline-only px cap (h) / legacy width cap
+DISPLAY_W_CAP_PX = 420  # attr cap: wider got width-squashed on iReader (imgtest4 F)
+# Wide display formulas are re-flowed into aligned multi-line LaTeX so no
+# single line is width-capped down to unreadable glyphs (a 90ex chain capped
+# to 420px shows its characters at under half body size).
 WIDE_SPLIT_EX = 46.0
 WIDE_SPLIT_LINE_EX = 44.0
 # Complex (tall) inline formulas get their px fallbacks boosted so their
@@ -623,26 +623,29 @@ def inject_svg_math(
         if png_meta is None or key not in png_meta:
             return None
         alt = html.escape(jobs[key]["latex"], quote=True)
-        box_w, box_h = FALLBACK_BOX_PX
+        box_h = FALLBACK_BOX_PX[1]
         if display:
-            # png_meta[key] = [(suffix, w_ex, h_ex), …] — one entry per
-            # strip for split multi-line formulas (all strips share the
-            # formula width so aligned columns line up).
-            parts = png_meta[key]
-            # Formula-level width scale (uniform across strips); per-strip
-            # height scale on top. ex declarations stay true throughout.
-            w_scale = min(1.0, box_w / (parts[0][1] * px_per_ex))
-            imgs = []
-            for suffix, w_ex, h_ex in parts:
-                s = min(w_scale, box_h / (h_ex * px_per_ex))
-                w_px, h_px = round(w_ex * px_per_ex * s), round(h_ex * px_per_ex * s)
-                imgs.append(
-                    f'<img src="../media/eq-{key}{suffix}.png" '
-                    f'width="{w_px}" height="{h_px}" '
-                    f'style="width:{w_px}px;width:{w_ex}ex;'
-                    f'height:{h_px}px;height:{h_ex}ex" alt="{alt}"/>'
-                )
-            return "\n".join(imgs)
+            # Whole-bitmap figure pattern (device-validated): the bitmap is
+            # RASTER_SCALE× the target size, so intrinsic attrs render it
+            # sharp 1:1 on px-only engines at ~RASTER_SCALE× text-relative
+            # size — deliberately larger display space for multi-line math
+            # (the book's content figures render full-height this way).
+            # Width capped at DISPLAY_W_CAP_PX (proportional height): wider
+            # attrs got width-squashed on iReader. NO max-width/height:auto
+            # in the class or style — iReader treats max-width:100% as
+            # width:100% (stretch) and height:auto re-enlarges bitmaps.
+            _, w_ex, h_ex = png_meta[key][0]
+            w_attr = round(w_ex * px_per_ex * RASTER_SCALE)
+            h_attr = round(h_ex * px_per_ex * RASTER_SCALE)
+            if w_attr > DISPLAY_W_CAP_PX:
+                h_attr = round(h_attr * DISPLAY_W_CAP_PX / w_attr)
+                w_attr = DISPLAY_W_CAP_PX
+            return (
+                f'<img class="math-display-img" src="../media/eq-{key}.png" '
+                f'width="{w_attr}" height="{h_attr}" '
+                f'style="width:{w_attr}px;width:{w_ex}ex;'
+                f'height:{h_attr}px;height:{h_ex}ex" alt="{alt}"/>'
+            )
         _, w_ex, h_ex = png_meta[key][0]
         valign = (cache.get(key) or {}).get("valign_ex", 0)
         v_px = round(valign * px_per_ex)
@@ -668,9 +671,11 @@ def inject_svg_math(
             return f'\n<div class="math-display">&#8203;\n{text_html}\n</div>\n'
         img = _img(key, display=True)
         if img is not None:
-            # &#8203; (zero-width space) defeats engines' "image-only block"
-            # special-casing (iReader upscales such blocks to full width).
-            return f'\n<div class="math-display">&#8203;\n{img}\n</div>\n'
+            # Bare <p> around the block img — the exact container shape of
+            # the book's content figures (device-validated full-height
+            # rendering). No ZWSP: it opts the block out of the sizing
+            # behaviour we are relying on.
+            return f'\n<p>{img}</p>\n'
         entry = cache.get(key) or {}
         if "svg" not in entry:
             return _raw_fallback(jobs[key]["latex"])
@@ -742,66 +747,15 @@ RASTER_SCALE = 2
 RASTER_COLORS = 32
 
 
-def _strip_bands(png: Path, min_px: int) -> list[tuple[int, int]]:
-    """Split a formula bitmap into (y0, y1) spans at low-ink rows.
-
-    A cut needs a run of >=2 interior rows whose ink covers at most
-    STRIP_INK_MAX_FRAC of the width — MathJax leaves such gaps between
-    array/aligned rows. Thin spanning ink does NOT block a cut (a tall
-    ``\\left\\{`` brace covers only a few percent of the width — cutting
-    through it trades a hairline gap in the stroke for rendering the rows
-    at full size instead of box-capped tiny); wide ink does (a fraction
-    bar, an \\hline).
-    """
-    from PIL import Image
-
-    with Image.open(png) as im:
-        alpha = im.convert("RGBA").getchannel("A")
-    w, h = alpha.size
-    inked = alpha.point(lambda a: 255 if a > 16 else 0)
-    frac = []
-    for y in range(h):
-        hist = inked.crop((0, y, w, y + 1)).histogram()
-        frac.append(hist[255] / w)
-    # Maximal interior runs of low-ink rows -> cut at the cleanest row.
-    cuts, y = [], 0
-    while y < h - 2:
-        if frac[y] > STRIP_INK_MAX_FRAC or y < 2:
-            y += 1
-            continue
-        y0, best = y, y
-        while y < h - 2 and frac[y] <= STRIP_INK_MAX_FRAC:
-            if frac[y] < frac[best]:
-                best = y
-            y += 1
-        if y - y0 >= 2:
-            cuts.append(best)
-    chosen, start = [], 0
-    for c in cuts:  # earliest cut that keeps every strip >= min_px
-        if c - start >= min_px:
-            chosen.append(c)
-            start = c
-    if chosen and h - chosen[-1] < min_px:  # don't leave a tiny tail strip
-        chosen.pop()
-    spans, start = [], 0
-    for c in chosen:
-        spans.append((start, c))
-        start = c
-    spans.append((start, h))
-    return spans
-
-
 def render_pngs(
     cache: dict, png_dir: Path, skip: set[str] | None = None,
 ) -> dict[str, list[tuple[str, float, float]]]:
     """Rasterise every cached SVG formula to PNG (2x, capped 1600px wide).
 
-    Returns {key: [(png_suffix, width_ex, height_ex), …]} — one entry for a
-    normal formula, one per line-strip for tall multi-line formulas (all
-    strips share the formula width so aligned columns line up when stacked).
-    The caller needs the ex-dimensions to size the <img> in CSS units so
-    formulas scale with the reader's font size. `skip` drops keys whose
-    formulas render as HTML text (no bitmap needed).
+    Returns {key: [("", width_ex, height_ex)]} — the caller needs the
+    ex-dimensions to size the <img> in CSS units so formulas scale with the
+    reader's font size. `skip` drops keys whose formulas render as HTML
+    text (no bitmap needed).
     """
     from concurrent.futures import ThreadPoolExecutor
     from PIL import Image
@@ -868,61 +822,11 @@ def render_pngs(
         except OSError as exc:
             print(f"  warning: png optimise failed for {out.name}: {exc}")
 
-    # Split tall display formulas into per-line strips at low-ink bands:
-    # each strip stays under the weak-engine image clamp (FALLBACK_BOX_PX),
-    # so multi-line math renders near full size instead of one squashed
-    # line. Full-width slices keep the horizontal alignment of stacked rows.
-    # Strip spans live in a sidecar (strips.json, versioned by rule): the
-    # band scan is the slow part, so spans are reused when the bitmap and
-    # the cut rule are unchanged; stale crop files are re-cut when not.
-    STRIP_RULE = 2  # low-ink-fraction cuts (v1 = fully-transparent bands)
-    sidecar = png_dir / "strips.json"
-    prev: dict = json.loads(sidecar.read_text(encoding="utf-8")) \
-        if sidecar.exists() else {}
-    prev_spans = prev.get("spans", {}) if prev.get("rule") == STRIP_RULE else {}
-    fresh = {out.stem[3:] for _, out, _ in jobs}  # re-rendered this run
-    spans_map: dict[str, list[list[int]]] = {}
-    n_split = 0
-    for key, parts in meta.items():
-        h_ex = parts[0][2]
-        if h_ex <= SPLIT_ABOVE_EX:
-            continue
-        full = png_dir / f"eq-{key}.png"
-        if key in prev_spans and key not in fresh:
-            spans = [tuple(s) for s in prev_spans[key]]
-        else:
-            spans = _strip_bands(full, round(STRIP_MIN_EX * 8 * RASTER_SCALE))
-        spans_map[key] = [list(s) for s in spans]
-        if len(spans) < 2:
-            continue  # unsplittable (dense ink throughout): px-cap
-        if prev_spans.get(key) != spans_map[key]:  # stale crops -> re-cut
-            for old in png_dir.glob(f"eq-{key}-p*.png"):
-                old.unlink()
-        with Image.open(full) as im:
-            bitmap_h = im.height
-            rgba = im.convert("RGBA")
-        strips = []
-        for i, (y0, y1) in enumerate(spans, 1):
-            suffix = f"-p{i}"
-            spath = png_dir / f"eq-{key}{suffix}.png"
-            if not (spath.exists() and _png_ok(spath)):
-                rgba.crop((0, y0, rgba.width, y1)).quantize(
-                    colors=RASTER_COLORS, method=2
-                ).save(spath, optimize=True)
-            strips.append((suffix, parts[0][1], round(h_ex * (y1 - y0) / bitmap_h, 3)))
-        meta[key] = strips
-        n_split += 1
-    # also drop orphaned strip files of formulas that no longer split
-    live = {f"eq-{k}-p{i}.png" for k, s in spans_map.items() if len(s) >= 2
-            for i in range(1, len(s) + 1)}
+    # One-time cleanup of the abandoned strip experiment (see the sizing
+    # comment block above the FALLBACK_BOX_PX constants).
     for old in png_dir.glob("eq-*-p*.png"):
-        if old.name not in live:
-            old.unlink()
-    sidecar.write_text(
-        json.dumps({"rule": STRIP_RULE, "spans": spans_map}), encoding="utf-8"
-    )
-    if n_split:
-        print(f"  split {n_split} tall formulas into line strips")
+        old.unlink()
+    (png_dir / "strips.json").unlink(missing_ok=True)
     return meta
 
 
