@@ -39,6 +39,11 @@ img.figure-img { display: block; margin: 1em auto; max-width: 100%; height: auto
 img.math-inline { display: inline; margin: 0; text-indent: 0; }
 .math-display { text-align: center; margin: 1em 0; text-indent: 0; }
 
+/* 单符号公式（x、α、xₙ）按正文文本渲染（位图在弱引擎上有最小高度
+   拉升，导致过大过粗）；斜体衬线遵循数学排版的字母习惯，样式被
+   丢弃时退化为正文文本，尺寸仍然正确。 */
+span.msym { font-style: italic; }
+
 /* 单个 HTML 表格 */
 table { border-collapse: collapse; margin: 1em auto; font-size: .95em; }
 th, td { border: 1px solid currentColor; padding: .3em .6em; }

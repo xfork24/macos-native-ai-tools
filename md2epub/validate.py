@@ -131,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
             mathml_count += text.count("<math ")
             svg_count += text.count("<svg")
             png_count += text.count('src="../media/eq-')
+            # trivial single-token formulas render as HTML text, not bitmaps
+            png_count += text.count('class="msym"')
             # pandoc's raw-TeX fallback spans are counted separately; only
             # delimiters outside them mean a formula was silently lost.
             fallback_spans += len(MATH_FALLBACK_RE.findall(text))

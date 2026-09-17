@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import html
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -371,6 +372,53 @@ FLIP_INLINE_MIN_H_EX = 3.0
 FALLBACK_BOX_PX = (380, 44)
 SPLIT_ABOVE_EX = 5.4  # tallest device-verified-safe display image (~43 px)
 STRIP_MIN_EX = 1.5  # don't shatter bitmaps into tiny slivers
+STRIP_INK_MAX_FRAC = 0.15  # a cut row may carry at most this fraction of ink
+# Wide display formulas are re-flowed into aligned multi-line LaTeX so each
+# line fits the box width and glyphs render near text size (a 57ex chain
+# width-capped to 380px shows its characters at ~83% of body size).
+WIDE_SPLIT_EX = 46.0
+WIDE_SPLIT_LINE_EX = 44.0
+# Complex (tall) inline formulas get their px fallbacks boosted so their
+# inner glyphs stay legible on px-only engines; ex values stay true.
+INLINE_BOOST_EX = 3.0
+INLINE_BOOST = 1.3
+
+# Trivial single-token formulas (x, \alpha, x_n, f') render as plain HTML
+# text instead of bitmaps: image-unfriendly engines enforce a minimum inline
+# image height (~one text line), which blows single glyphs up oversized and
+# blurry (device report: x/y/α 过大过粗). Text is text-size everywhere.
+_GREEK = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "vartheta": "ϑ",
+    "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ",
+    "pi": "π", "varpi": "ϖ", "rho": "ρ", "varrho": "ϱ", "sigma": "σ",
+    "varsigma": "ς", "tau": "τ", "upsilon": "υ", "phi": "φ", "varphi": "φ",
+    "chi": "χ", "psi": "ψ", "omega": "ω", "Gamma": "Γ", "Delta": "Δ",
+    "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ", "Pi": "Π", "Sigma": "Σ",
+    "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω", "ell": "ℓ",
+}
+_TEX_TEXT_RE = re.compile(
+    r"^(?:\\(?P<cmd>[a-zA-Z]+)|(?P<lit>[A-Za-z]))"
+    r"(?P<prime>'*)"
+    r"(?:(?P<op>[_^])(?P<script>\{?[A-Za-z0-9]{1,6}\}?))?$"
+)
+
+
+def _text_symbol_html(latex: str) -> str | None:
+    """HTML for trivial single-token formulas, else None."""
+    m = _TEX_TEXT_RE.match(latex.strip())
+    if not m:
+        return None
+    ch = _GREEK.get(m["cmd"] or "") if m["cmd"] else m["lit"]
+    if ch is None:
+        return None
+    html = f'<span class="msym">{ch}</span>'
+    if m["prime"]:
+        html += "<span>′</span>" * len(m["prime"])
+    if m["script"]:
+        tag = "sub" if m["op"] == "_" else "sup"
+        html += f"<{tag}>{m['script'].strip('{}')}</{tag}>"
+    return html
 
 
 def _decide_flips(cache: dict, jobs: dict) -> dict[str, bool]:
@@ -397,6 +445,118 @@ def _decide_flips(cache: dict, jobs: dict) -> dict[str, bool]:
         ):
             flips[key] = True
     return flips
+
+
+# Depth-0 relation operators, longest first (regex-alternation safe).
+_RELATIONS = (
+    "\\Leftrightarrow", "\\Longleftrightarrow", "\\Longrightarrow",
+    "\\rightleftharpoons", "\\longrightarrow", "\\leftrightarrow",
+    "\\rightarrow", "\\leqslant", "\\geqslant", "\\equiv", "\\leq",
+    "\\geq", "\\approx", "\\propto", "\\sim", "\\cong", "\\doteq",
+    "=", "<", ">",
+)
+_REL_RE = re.compile("|".join(re.escape(r) for r in _RELATIONS))
+_OPEN_DELIMS = ("\\left", "\\bigl", "\\biggl", "\\Bigl", "\\big", "\\Big")
+_CLOSE_DELIMS = ("\\right", "\\bigr", "\\biggr", "\\Bigr")
+
+
+def _depth0_relations(latex: str) -> list[int]:
+    """Start offsets of relation operators at brace/\\left group depth 0."""
+    cuts, depth, i, n = [], 0, 0, len(latex)
+    while i < n:
+        c = latex[i]
+        if c == "{":
+            depth += 1
+            i += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+            i += 1
+        elif c == "\\":
+            m = re.match(r"\\[a-zA-Z]+", latex[i:])
+            if not m:  # \\, \\; etc. — skip both chars
+                i += 2
+                continue
+            name = m.group(0)
+            if name in _OPEN_DELIMS:
+                depth += 1
+            elif name in _CLOSE_DELIMS:
+                depth = max(0, depth - 1)
+            i += len(m.group(0))
+        elif depth == 0:
+            m = _REL_RE.match(latex, i)
+            if m:
+                cuts.append(i)
+                i += len(m.group(0))
+            else:
+                i += 1
+        else:
+            i += 1
+    return cuts
+
+
+def _split_wide_latex(latex: str, w_ex: float) -> str | None:
+    """Re-flow an over-wide single-line equation into an aligned block.
+
+    Breaks BEFORE depth-0 relations (each continuation line starts with its
+    =/≤/⇒, &-aligned like standard math continuation typesetting). Returns
+    None when the formula is already multi-line or offers no usable break.
+    """
+    if "\\begin{" in latex or "\n" in latex or "&" in latex:
+        return None
+    n_lines = max(2, math.ceil(w_ex / WIDE_SPLIT_LINE_EX))
+    cuts = _depth0_relations(latex)
+    if len(cuts) < n_lines - 1:
+        return None
+    chosen: list[int] = []
+    for t in range(1, n_lines):
+        target = len(latex) * t / n_lines
+        floor = chosen[-1] if chosen else 0
+        cands = [c for c in cuts if c > floor]
+        if not cands:
+            return None
+        chosen.append(min(cands, key=lambda c: abs(c - target)))
+    parts, prev = [], 0
+    for c in chosen:
+        parts.append(latex[prev:c])
+        prev = c
+    parts.append(latex[prev:])
+    # parts[1:] each start with the relation; & marks the alignment column.
+    lines = [parts[0].rstrip() + " & " + parts[1].lstrip()]
+    lines += ["& " + p.lstrip() for p in parts[2:]]
+    return "\\begin{aligned}\n" + " \\\\\n".join(lines) + "\n\\end{aligned}"
+
+
+def _split_wide_formulas(
+    md_text: str, jobs: dict, cache: dict, build_dir: Path,
+) -> tuple[str, dict, dict]:
+    """Wrap over-wide display formulas (see _split_wide_latex).
+
+    Runs after the first render + style flips: only formulas still wider
+    than WIDE_SPLIT_EX at that point are re-flowed, re-rendered under a new
+    key (hash of the aligned LaTeX — deterministic, so reruns are idempotent)
+    and the tokenised markdown is re-pointed at the new key.
+    """
+    todo: dict[str, dict] = {}
+    for key, job in list(jobs.items()):
+        if "text_html" in job or not job["display"]:
+            continue
+        entry = cache.get(key) or {}
+        dims = _svg_ex_dims(entry["svg"]) if "svg" in entry else None
+        if not dims or dims[0] <= WIDE_SPLIT_EX:
+            continue
+        new_latex = _split_wide_latex(job["latex"], dims[0])
+        if not new_latex:
+            continue
+        new_key = _hash(new_latex)
+        md_text = md_text.replace(f"⟂MATHD:{key}⟂", f"⟂MATHD:{new_key}⟂")
+        todo[new_key] = {"latex": new_latex, "display": True}
+        del jobs[key]
+    if not todo:
+        return md_text, jobs, cache
+    print(f"  wide-split: re-flowed {len(todo)} long equations into aligned lines")
+    cache, _ = render_math_via_node(todo, build_dir, build_dir / "math_cache.json")
+    jobs.update(todo)
+    return md_text, jobs, cache
 
 
 def render_math_via_node(
@@ -486,13 +646,15 @@ def inject_svg_math(
         _, w_ex, h_ex = png_meta[key][0]
         valign = (cache.get(key) or {}).get("valign_ex", 0)
         v_px = round(valign * px_per_ex)
-        # px height capped into the safe box (ex stays true); no width
-        # attribute (device-verified, imgtest5/6): engines that must fit an
-        # inline image into the remaining line width squeeze the width and
-        # keep the height when both attrs are pinned (KOReader), breaking
-        # the aspect — with height alone every engine derives width from
-        # the bitmap ratio, so the aspect can never break.
-        h_px = round(min(h_ex * px_per_ex, box_h))
+        # px height capped into the safe box (ex stays true); complex (tall)
+        # inline formulas get a px boost so inner glyphs stay legible on
+        # px-only engines. No width attribute (device-verified, imgtest5/6):
+        # engines that must fit an inline image into the remaining line width
+        # squeeze the width and keep the height when both attrs are pinned
+        # (KOReader), breaking the aspect — with height alone every engine
+        # derives width from the bitmap ratio, so the aspect can never break.
+        boost = INLINE_BOOST if h_ex >= INLINE_BOOST_EX else 1.0
+        h_px = round(min(h_ex * px_per_ex * boost, box_h))
         return (
             f'<img class="math-inline" src="../media/eq-{key}.png" '
             f'height="{h_px}" '
@@ -501,6 +663,9 @@ def inject_svg_math(
         )
 
     def display_block(key: str) -> str:
+        text_html = jobs[key].get("text_html")
+        if text_html:
+            return f'\n<div class="math-display">&#8203;\n{text_html}\n</div>\n'
         img = _img(key, display=True)
         if img is not None:
             # &#8203; (zero-width space) defeats engines' "image-only block"
@@ -513,6 +678,9 @@ def inject_svg_math(
         return f'\n<div class="math-display">\n{svg}\n</div>\n'
 
     def inline_span(key: str) -> str:
+        text_html = jobs[key].get("text_html")
+        if text_html:
+            return text_html
         img = _img(key, display=False)
         if img is not None:
             return img
@@ -575,11 +743,15 @@ RASTER_COLORS = 32
 
 
 def _strip_bands(png: Path, min_px: int) -> list[tuple[int, int]]:
-    """Split a formula bitmap into (y0, y1) spans at fully transparent rows.
+    """Split a formula bitmap into (y0, y1) spans at low-ink rows.
 
-    A cut only happens on an interior blank band (MathJax leaves one between
-    array/aligned rows); constructs whose ink spans every row — a tall
-    ``\\left\\{`` brace, a fraction bar — come back unsplit.
+    A cut needs a run of >=2 interior rows whose ink covers at most
+    STRIP_INK_MAX_FRAC of the width — MathJax leaves such gaps between
+    array/aligned rows. Thin spanning ink does NOT block a cut (a tall
+    ``\\left\\{`` brace covers only a few percent of the width — cutting
+    through it trades a hairline gap in the stroke for rendering the rows
+    at full size instead of box-capped tiny); wide ink does (a fraction
+    bar, an \\hline).
     """
     from PIL import Image
 
@@ -587,18 +759,23 @@ def _strip_bands(png: Path, min_px: int) -> list[tuple[int, int]]:
         alpha = im.convert("RGBA").getchannel("A")
     w, h = alpha.size
     inked = alpha.point(lambda a: 255 if a > 16 else 0)
-    empty = [inked.crop((0, y, w, y + 1)).getbbox() is None for y in range(h)]
+    frac = []
+    for y in range(h):
+        hist = inked.crop((0, y, w, y + 1)).histogram()
+        frac.append(hist[255] / w)
+    # Maximal interior runs of low-ink rows -> cut at the cleanest row.
     cuts, y = [], 0
-    while y < h:
-        if not empty[y]:
+    while y < h - 2:
+        if frac[y] > STRIP_INK_MAX_FRAC or y < 2:
             y += 1
             continue
-        y0 = y
-        while y < h and empty[y]:
+        y0, best = y, y
+        while y < h - 2 and frac[y] <= STRIP_INK_MAX_FRAC:
+            if frac[y] < frac[best]:
+                best = y
             y += 1
-        # interior bands only (not the padding around the ink), >= 2 px tall
-        if y0 > 2 and y < h - 2 and y - y0 >= 2:
-            cuts.append((y0 + y) // 2)
+        if y - y0 >= 2:
+            cuts.append(best)
     chosen, start = [], 0
     for c in cuts:  # earliest cut that keeps every strip >= min_px
         if c - start >= min_px:
@@ -614,14 +791,17 @@ def _strip_bands(png: Path, min_px: int) -> list[tuple[int, int]]:
     return spans
 
 
-def render_pngs(cache: dict, png_dir: Path) -> dict[str, list[tuple[str, float, float]]]:
+def render_pngs(
+    cache: dict, png_dir: Path, skip: set[str] | None = None,
+) -> dict[str, list[tuple[str, float, float]]]:
     """Rasterise every cached SVG formula to PNG (2x, capped 1600px wide).
 
     Returns {key: [(png_suffix, width_ex, height_ex), …]} — one entry for a
     normal formula, one per line-strip for tall multi-line formulas (all
     strips share the formula width so aligned columns line up when stacked).
     The caller needs the ex-dimensions to size the <img> in CSS units so
-    formulas scale with the reader's font size.
+    formulas scale with the reader's font size. `skip` drops keys whose
+    formulas render as HTML text (no bitmap needed).
     """
     from concurrent.futures import ThreadPoolExecutor
     from PIL import Image
@@ -631,7 +811,7 @@ def render_pngs(cache: dict, png_dir: Path) -> dict[str, list[tuple[str, float, 
     jobs: list[tuple[Path, Path, int]] = []
 
     for key, entry in cache.items():
-        if "svg" not in entry:
+        if "svg" not in entry or (skip and key in skip):
             continue
         root_tag = entry["svg"][: entry["svg"].index(">")]
         m = re.search(r'width="([\d.]+)ex" height="([\d.]+)ex"', root_tag)
@@ -688,19 +868,36 @@ def render_pngs(cache: dict, png_dir: Path) -> dict[str, list[tuple[str, float, 
         except OSError as exc:
             print(f"  warning: png optimise failed for {out.name}: {exc}")
 
-    # Split tall display formulas into per-line strips at transparent bands:
+    # Split tall display formulas into per-line strips at low-ink bands:
     # each strip stays under the weak-engine image clamp (FALLBACK_BOX_PX),
     # so multi-line math renders near full size instead of one squashed
     # line. Full-width slices keep the horizontal alignment of stacked rows.
+    # Strip spans live in a sidecar (strips.json, versioned by rule): the
+    # band scan is the slow part, so spans are reused when the bitmap and
+    # the cut rule are unchanged; stale crop files are re-cut when not.
+    STRIP_RULE = 2  # low-ink-fraction cuts (v1 = fully-transparent bands)
+    sidecar = png_dir / "strips.json"
+    prev: dict = json.loads(sidecar.read_text(encoding="utf-8")) \
+        if sidecar.exists() else {}
+    prev_spans = prev.get("spans", {}) if prev.get("rule") == STRIP_RULE else {}
+    fresh = {out.stem[3:] for _, out, _ in jobs}  # re-rendered this run
+    spans_map: dict[str, list[list[int]]] = {}
     n_split = 0
     for key, parts in meta.items():
         h_ex = parts[0][2]
         if h_ex <= SPLIT_ABOVE_EX:
             continue
         full = png_dir / f"eq-{key}.png"
-        spans = _strip_bands(full, round(STRIP_MIN_EX * 8 * RASTER_SCALE))
+        if key in prev_spans and key not in fresh:
+            spans = [tuple(s) for s in prev_spans[key]]
+        else:
+            spans = _strip_bands(full, round(STRIP_MIN_EX * 8 * RASTER_SCALE))
+        spans_map[key] = [list(s) for s in spans]
         if len(spans) < 2:
-            continue  # unsplittable (spanning brace / fraction bar): px-cap
+            continue  # unsplittable (dense ink throughout): px-cap
+        if prev_spans.get(key) != spans_map[key]:  # stale crops -> re-cut
+            for old in png_dir.glob(f"eq-{key}-p*.png"):
+                old.unlink()
         with Image.open(full) as im:
             bitmap_h = im.height
             rgba = im.convert("RGBA")
@@ -715,6 +912,15 @@ def render_pngs(cache: dict, png_dir: Path) -> dict[str, list[tuple[str, float, 
             strips.append((suffix, parts[0][1], round(h_ex * (y1 - y0) / bitmap_h, 3)))
         meta[key] = strips
         n_split += 1
+    # also drop orphaned strip files of formulas that no longer split
+    live = {f"eq-{k}-p{i}.png" for k, s in spans_map.items() if len(s) >= 2
+            for i in range(1, len(s) + 1)}
+    for old in png_dir.glob("eq-*-p*.png"):
+        if old.name not in live:
+            old.unlink()
+    sidecar.write_text(
+        json.dumps({"rule": STRIP_RULE, "spans": spans_map}), encoding="utf-8"
+    )
     if n_split:
         print(f"  split {n_split} tall formulas into line strips")
     return meta
@@ -1289,6 +1495,7 @@ def build_report(epub_path: Path, mode: str) -> dict:
         math_count = sample.count(b"<math ")
     elif mode == "png":
         math_count = sample.count(b'src="../media/eq-')
+        math_count += sample.count(b'class="msym"')  # text-rendered symbols
     else:
         math_count = sample.count(b"<svg")
     return {
@@ -1361,7 +1568,23 @@ def main(argv: list[str] | None = None) -> int:
             tokenised, jobs = tokenise_math(text)
             print(f"  formulas: {len(jobs)} unique "
                   f"(from {sum(count_math(text))} occurrences)")
-            cache, jobs = render_math_via_node(jobs, build_dir, build_dir / "math_cache.json")
+            if mode == "png":
+                # Trivial single-token formulas (x, \alpha, x_n, f') become
+                # plain HTML text: px-fallback engines enforce a minimum
+                # inline image height, which blows single glyphs up oversized
+                # and blurry; text is text-size on every engine.
+                n_text = 0
+                for job in jobs.values():
+                    th = _text_symbol_html(job["latex"])
+                    if th:
+                        job["text_html"] = th
+                        n_text += 1
+                if n_text:
+                    print(f"  text symbols: {n_text} trivial formulas -> HTML text")
+            render_jobs = {k: v for k, v in jobs.items() if "text_html" not in v}
+            cache, _ = render_math_via_node(
+                render_jobs, build_dir, build_dir / "math_cache.json"
+            )
             svg_cache, svg_jobs = cache, jobs
             if "$" in tokenised:
                 raise ConvertError("'$' remains after tokenisation — untokenised math?")
@@ -1391,7 +1614,18 @@ def main(argv: list[str] | None = None) -> int:
                         (build_dir / "png_cache" / f"eq-{k}.png").unlink(
                             missing_ok=True
                         )
-                png_meta = render_pngs(cache, build_dir / "png_cache")
+                # Over-wide display equations: re-flow into aligned lines so
+                # each line fits the box width and glyphs render near text
+                # size instead of width-capped small.
+                md_text, jobs, cache = _split_wide_formulas(
+                    md_text, jobs, cache, build_dir
+                )
+                svg_cache, svg_jobs = cache, jobs
+                png_meta = render_pngs(
+                    cache,
+                    build_dir / "png_cache",
+                    skip={k for k, j in jobs.items() if "text_html" in j},
+                )
         md_out = build_dir / f"preprocessed.{mode}.md"
         md_out.write_text(md_text, encoding="utf-8")
         out_epub = out_dir / f"{book_stem}.{mode}.epub"
