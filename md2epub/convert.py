@@ -41,6 +41,9 @@ DEFAULTS = {
     # and the px CSS declarations) = ex value * this factor. 8 ≈ 1ex of a
     # 16px body font. Per-book override for device calibration (imgtest4).
     "png_px_per_ex": 8.0,
+    # Display-bitmap canvas width in bitmap px (see DISPLAY_CANVAS_PX):
+    # calibrates on-device glyph size on aspect-stretching engines.
+    "png_display_canvas_px": 720,
     "chapter_regex": r"^#+\s*第[一二三四五六七八九十]+章",
     "promote_h1_patterns": [
         r"^## (第[一二三四五六七八九十]+章.*)",
@@ -357,22 +360,28 @@ FLIP_DISPLAY_MAX_H_EX = 2.5
 FLIP_DISPLAY_MAX_W_EX = 25.0
 FLIP_INLINE_MIN_H_EX = 3.0
 
-# png-mode display sizing, decided across imgtest4/5/6 device rounds:
-#   - iReader clamps INLINE-LEVEL formula images taller than ~44 css px to
-#     a single text line (formula markup variants all failed), but renders
-#     content figures — <p><img class="figure-img"/> with intrinsic px
-#     attrs and no style — at FULL height (the book's 119 figures prove it
-#     on both target readers). Display formulas therefore use exactly the
-#     figure pattern: whole bitmap, intrinsic attrs, block-level.
-#   - iReader also squashes over-wide images (width shrunk, height kept),
-#     so display attrs are capped at DISPLAY_W_CAP_PX.
-#   - KOReader and full-CSS engines render every variant fine; the dual-unit
-#     style keeps ex-true font scaling there.
-# (An earlier approach split tall formula bitmaps into per-line strips to
-# dodge the inline clamp — abandoned: cuts through short intra-construct
-# seams tore fractions/limits apart on real devices.)
-FALLBACK_BOX_PX = (380, 44)  # inline-only px cap (h) / legacy width cap
-DISPLAY_W_CAP_PX = 420  # attr cap: wider got width-squashed on iReader (imgtest4 F)
+# png-mode display sizing, decided across imgtest4-7 device rounds:
+#   - iReader renders an image-only paragraph ~full-width BY ASPECT RATIO:
+#     absolute px attrs/styles take no part (imgtest7 — five container
+#     markups at attr widths 138-408px all rendered the same "somewhat
+#     large"). The ONLY on-device size lever is the bitmap's own geometry.
+#   - Display bitmaps are therefore centred on a common transparent canvas
+#     DISPLAY_CANVAS_PX wide: stretched to screen width, the glyphs land at
+#     ~screen_w * RASTER_SCALE / canvas css px per ex — text parity to 1.3x
+#     on 600-750 css px screens (up from 4-5x for narrow formulas).
+#   - KOReader/full-CSS engines size by the ex style (the canvas is
+#     invisible padding); a canvas-wide box at very large fonts shrink-fits
+#     the column at ~0.75x — reported "偏小但可接受" in the same round.
+#     Per-book calibration knob: "png_display_canvas_px".
+#   - Inline markup cannot exceed iReader's ~44px line clamp whatever the
+#     markup (imgtest5/6), so formulas taller than PROMOTE_INLINE_EX are
+#     re-flowed onto their own display line (standard math typesetting for
+#     tall formulas; the 108 book occurrences are exactly the squeezed ones).
+# (Two earlier approaches are dead: px box-capping (iReader clamps it to a
+# text line) and strip-splitting bitmaps (cuts tore fractions apart).)
+FALLBACK_BOX_PX = (380, 44)  # inline-only px height cap
+DISPLAY_CANVAS_PX = 720  # display bitmap canvas width (bitmap px)
+PROMOTE_INLINE_EX = 4.8  # taller inline formulas go on their own line
 # Wide display formulas are re-flowed into aligned multi-line LaTeX so no
 # single line is width-capped down to unreadable glyphs (a 90ex chain capped
 # to 420px shows its characters at under half body size).
@@ -604,17 +613,21 @@ def render_math_via_node(
 
 def inject_svg_math(
     xhtml: str, cache: dict, jobs: dict, png_meta: dict | None = None,
-    px_per_ex: float = 8.0,
+    px_per_ex: float = 8.0, media_dir: Path | None = None,
+    canvas_px: int = DISPLAY_CANVAS_PX,
 ) -> str:
     """Substitute tokens in a pandoc-produced XHTML fragment with math HTML.
 
-    The SVG/PNG markup never passes through pandoc's markdown reader: nested
+    The math markup never passes through pandoc's markdown reader: nested
     <svg> roots (MathJax emits them for tables/stretchy pieces) break its
     html-block state machine. Tokens are inert text, so pandoc leaves them
     alone and we splice the real markup into its output.
 
-    png_meta given -> <img>-referenced PNGs (readers without inline-SVG
-    support, e.g. iReader); otherwise inline <svg> elements.
+    Every formula becomes an <img> referencing a file in EPUB/media/ —
+    PNG bitmaps when png_meta is given, external .svg files otherwise
+    (media_dir set). File references, never inline embedding: format
+    converters (Kindle azw3 via calibre etc.) drop inline <svg> but pass
+    referenced media items through.
     """
     def _raw_fallback(latex: str) -> str:
         return f'<code class="math-raw">{html.escape(latex, quote=False)}</code>'
@@ -625,26 +638,22 @@ def inject_svg_math(
         alt = html.escape(jobs[key]["latex"], quote=True)
         box_h = FALLBACK_BOX_PX[1]
         if display:
-            # Whole-bitmap figure pattern (device-validated): the bitmap is
-            # RASTER_SCALE× the target size, so intrinsic attrs render it
-            # sharp 1:1 on px-only engines at ~RASTER_SCALE× text-relative
-            # size — deliberately larger display space for multi-line math
-            # (the book's content figures render full-height this way).
-            # Width capped at DISPLAY_W_CAP_PX (proportional height): wider
-            # attrs got width-squashed on iReader. NO max-width/height:auto
-            # in the class or style — iReader treats max-width:100% as
-            # width:100% (stretch) and height:auto re-enlarges bitmaps.
+            # Canvas-box markup (see DISPLAY_CANVAS_PX): the bitmap carries
+            # transparent side padding up to the canvas width (render_pngs),
+            # so the img box must match the PADDED bitmap's aspect to avoid
+            # distortion on attr/px-honoring engines — width = max(canvas,
+            # content), height = content height. On iReader (which renders
+            # image paragraphs ~full-width by bitmap aspect) the canvas
+            # itself calibrates glyph size. NO max-width/height:auto —
+            # iReader treats max-width:100% as width:100% (stretch).
             _, w_ex, h_ex = png_meta[key][0]
-            w_attr = round(w_ex * px_per_ex * RASTER_SCALE)
-            h_attr = round(h_ex * px_per_ex * RASTER_SCALE)
-            if w_attr > DISPLAY_W_CAP_PX:
-                h_attr = round(h_attr * DISPLAY_W_CAP_PX / w_attr)
-                w_attr = DISPLAY_W_CAP_PX
+            w_box = max(canvas_px / (px_per_ex * RASTER_SCALE), w_ex)
+            w_attr, h_attr = round(w_box * px_per_ex), round(h_ex * px_per_ex)
             return (
                 f'<img class="math-display-img" src="../media/eq-{key}.png" '
                 f'width="{w_attr}" height="{h_attr}" '
-                f'style="width:{w_attr}px;width:{w_ex}ex;'
-                f'height:{h_attr}px;height:{h_ex}ex" alt="{alt}"/>'
+                f'style="width:{w_attr}px;width:{w_box:g}ex;'
+                f'height:{h_attr}px;height:{h_ex:g}ex" alt="{alt}"/>'
             )
         _, w_ex, h_ex = png_meta[key][0]
         valign = (cache.get(key) or {}).get("valign_ex", 0)
@@ -665,16 +674,53 @@ def inject_svg_math(
             f'vertical-align:{v_px}px;vertical-align:{valign}ex" alt="{alt}"/>'
         )
 
-    def display_block(key: str) -> str:
+    def _svg_ref(key: str, entry: dict, display: bool) -> str | None:
+        """External .svg file reference (svg mode). None -> caller falls
+        back to inline splicing (no media dir) or the raw-TeX fallback."""
+        if media_dir is None:
+            return None
+        dims = _svg_ex_dims(entry["svg"])
+        if not dims:
+            return None
+        w_ex, h_ex = dims
+        f = media_dir / f"eq-{key}.svg"
+        if not f.exists():
+            f.write_text(entry["svg"], encoding="utf-8")
+        alt = html.escape(jobs[key]["latex"], quote=True)
+        if display:
+            w_attr, h_attr = round(w_ex * px_per_ex), round(h_ex * px_per_ex)
+            return (
+                f'<img class="math-display-img" src="../media/eq-{key}.svg" '
+                f'width="{w_attr}" height="{h_attr}" '
+                f'style="width:{w_attr}px;width:{w_ex:g}ex;'
+                f'height:{h_attr}px;height:{h_ex:g}ex" alt="{alt}"/>'
+            )
+        valign = entry.get("valign_ex", 0)
+        h_px, v_px = round(h_ex * px_per_ex), round(valign * px_per_ex)
+        return (
+            f'<img class="math-inline" src="../media/eq-{key}.svg" '
+            f'height="{h_px}" '
+            f'style="height:{h_px}px;height:{h_ex:g}ex;'
+            f'vertical-align:{v_px}px;vertical-align:{valign:g}ex" alt="{alt}"/>'
+        )
+
+    def display_block(key: str, tail: str = "") -> str:
         text_html = jobs[key].get("text_html")
         if text_html:
-            return f'\n<div class="math-display">&#8203;\n{text_html}\n</div>\n'
+            return f'\n<div class="math-display">&#8203;\n{text_html}{tail}\n</div>\n'
         img = _img(key, display=True)
+        if img is None:
+            entry = cache.get(key) or {}
+            if "svg" in entry:
+                img = _svg_ref(key, entry, display=True)
         if img is not None:
             # Bare <p> around the block img — the exact container shape of
             # the book's content figures (device-validated full-height
-            # rendering). No ZWSP: it opts the block out of the sizing
-            # behaviour we are relying on.
+            # rendering). No ZWSP and NO trailing text node: any text in the
+            # paragraph opts it out of the image-only sizing path. Punctuation
+            # carried over from the promotion re-flow gets its own centred p.
+            if tail:
+                return f'\n<p>{img}</p>\n<p class="math-tail">{tail}</p>\n'
             return f'\n<p>{img}</p>\n'
         entry = cache.get(key) or {}
         if "svg" not in entry:
@@ -687,6 +733,10 @@ def inject_svg_math(
         if text_html:
             return text_html
         img = _img(key, display=False)
+        if img is None:
+            entry = cache.get(key) or {}
+            if "svg" in entry:
+                img = _svg_ref(key, entry, display=False)
         if img is not None:
             return img
         entry = cache.get(key) or {}
@@ -695,15 +745,17 @@ def inject_svg_math(
         svg = re.sub(r"\s+", " ", entry["svg"]).strip()
         valign = entry.get("valign_ex", 0)
         return (
-            f'<span class="math-inline" style="vertical-align:{valign}ex">{svg}</span>'
+            f'<span class="math-inline" style="vertical-align:{valign:g}ex">{svg}</span>'
         )
 
     # Standalone display tokens arrive as <p>⟂MATHD:…⟂</p> — swap the whole
-    # paragraph for the div. Tokens in other containers (li, blockquote) are
-    # replaced in place, which keeps the div nested legally inside them.
+    # paragraph for the block. Tokens in other containers (li, blockquote)
+    # are replaced in place, which keeps the block nested legally inside
+    # them. The tail group carries punctuation that promotion re-flow kept
+    # on the formula line.
     xhtml = re.sub(
-        r"<p>\s*⟂MATHD:([0-9a-f]+)⟂\s*</p>",
-        lambda m: display_block(m.group(1)),
+        r"<p>\s*⟂MATHD:([0-9a-f]+)⟂([^<]*)</p>",
+        lambda m: display_block(m.group(1), m.group(2)),
         xhtml,
     )
     xhtml = re.sub(r"⟂MATHD:([0-9a-f]+)⟂", lambda m: display_block(m.group(1)), xhtml)
@@ -749,13 +801,18 @@ RASTER_COLORS = 32
 
 def render_pngs(
     cache: dict, png_dir: Path, skip: set[str] | None = None,
+    display_keys: set[str] | None = None, px_per_ex: float = 8.0,
+    canvas_px: int = DISPLAY_CANVAS_PX,
 ) -> dict[str, list[tuple[str, float, float]]]:
     """Rasterise every cached SVG formula to PNG (2x, capped 1600px wide).
 
     Returns {key: [("", width_ex, height_ex)]} — the caller needs the
     ex-dimensions to size the <img> in CSS units so formulas scale with the
     reader's font size. `skip` drops keys whose formulas render as HTML
-    text (no bitmap needed).
+    text (no bitmap needed). Display-key bitmaps are centred on a common
+    transparent canvas `canvas_px` wide (see DISPLAY_CANVAS_PX) and their
+    meta becomes the canvas box, so the img can keep aspect against the
+    padded bitmap on every engine.
     """
     from concurrent.futures import ThreadPoolExecutor
     from PIL import Image
@@ -827,6 +884,39 @@ def render_pngs(
     for old in png_dir.glob("eq-*-p*.png"):
         old.unlink()
     (png_dir / "strips.json").unlink(missing_ok=True)
+
+    # Display-bitmap canvas pass: centring the content on a common
+    # transparent canvas is what calibrates glyph size on iReader (it
+    # renders image paragraphs ~full-width by bitmap aspect). A bitmap wider
+    # than its content is padding from an earlier canvas width (padded
+    # bitmaps are exactly canvas-wide, content centred) — crop the content
+    # back out first, so changing the canvas re-pads correctly in BOTH
+    # directions. meta keeps the CONTENT ex-dims — the display markup
+    # derives the canvas box from them (see _img).
+    n_pad = 0
+    for key in display_keys or ():
+        if key not in meta:
+            continue
+        _, w_ex, _ = meta[key][0]
+        out = png_dir / f"eq-{key}.png"
+        with Image.open(out) as im:
+            w, h = im.size
+            w_content = max(min(round(w_ex * 8 * RASTER_SCALE), 1600), 8)
+            if w > w_content:  # strip previous canvas padding (centred)
+                x0 = (w - w_content) // 2
+                im = im.crop((x0, 0, x0 + w_content, h))
+                w = w_content
+            if w >= canvas_px:
+                continue  # wide content: canvas would add nothing
+            rgba = im.convert("RGBA")
+        canvas = Image.new("RGBA", (canvas_px, h), (0, 0, 0, 0))
+        canvas.paste(rgba, ((canvas_px - w) // 2, 0), rgba)
+        canvas.quantize(colors=RASTER_COLORS, method=2).save(
+            out, optimize=True
+        )
+        n_pad += 1
+    if n_pad:
+        print(f"  display canvas: centred {n_pad} bitmaps on {canvas_px}px")
     return meta
 
 
@@ -1026,14 +1116,15 @@ def build_epub_chunked(
     cache: dict, jobs: dict, png_meta: dict | None = None,
     png_dir: Path | None = None, css_file: Path | None = None,
     metadata_path: Path | None = None, px_per_ex: float = 8.0,
+    canvas_px: int = DISPLAY_CANVAS_PX,
 ) -> None:
     """svg/png-mode assembly: pandoc per H1/H2 section, package the zip ourselves.
 
-    md_text carries math as ⟂MATHx:hash⟂ tokens; the real markup (inline SVG,
-    or <img>-referenced PNGs when png_meta is given) is spliced in after
-    pandoc (see inject_svg_math). png mode passes the class-scoped
-    epub-png.css: bare-img CSS rules make ex-blind engines fall back to
-    intrinsic bitmap size.
+    md_text carries math as ⟂MATHx:hash⟂ tokens; the real markup —
+    <img> references to media files (PNG bitmaps for png mode, external
+    .svg for svg mode) — is spliced in after pandoc (see inject_svg_math).
+    Both modes pass the class-scoped epub-png.css: bare-img CSS rules make
+    ex-blind engines fall back to intrinsic bitmap size.
     """
     meta = _read_metadata(metadata_path)
     sections = _split_sections(md_text)
@@ -1084,7 +1175,10 @@ def build_epub_chunked(
             return f'<img class="figure-img" src="{src}"{dims} />'
 
         xhtml = re.sub(r'<img src="(\.\./media/(img\d+\.[^"]+))" */>', _augment, xhtml)
-        xhtml = inject_svg_math(xhtml, cache, jobs, png_meta, px_per_ex)
+        xhtml = inject_svg_math(
+            xhtml, cache, jobs, png_meta, px_per_ex,
+            media_dir=staging / "EPUB" / "media", canvas_px=canvas_px,
+        )
         if png_meta is not None and png_dir is not None:
             for name in set(
                 re.findall(r'src="\.\./media/(eq-[^"/]+\.png)"', xhtml)
@@ -1160,7 +1254,10 @@ def build_epub_chunked(
     extra_media = sorted(
         p for p in (staging / "EPUB" / "media").iterdir() if p.name != "cover.jpg"
     )
-    media_types = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+    media_types = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+        ".svg": "image/svg+xml",
+    }
     manifest += [
         f'<item id="m{i}" href="media/{p.name}" '
         f'media-type="{media_types.get(p.suffix, "application/octet-stream")}"/>'
@@ -1397,11 +1494,9 @@ def build_report(epub_path: Path, mode: str) -> dict:
         sample = b"".join(zf.read(n) for n in xhtml)
     if mode == "mathml":
         math_count = sample.count(b"<math ")
-    elif mode == "png":
+    else:  # svg/png: every formula is an <img> reference into EPUB/media/
         math_count = sample.count(b'src="../media/eq-')
         math_count += sample.count(b'class="msym"')  # text-rendered symbols
-    else:
-        math_count = sample.count(b"<svg")
     return {
         "file": epub_path.name,
         "size_mb": round(epub_path.stat().st_size / 1e6, 2),
@@ -1525,10 +1620,63 @@ def main(argv: list[str] | None = None) -> int:
                     md_text, jobs, cache, build_dir
                 )
                 svg_cache, svg_jobs = cache, jobs
+                # Tall inline formulas are clamped to one text line on weak
+                # engines whatever the markup (imgtest5/6): re-flow them
+                # onto their own display line — standard math typesetting
+                # for tall formulas. Dims come from the rendered SVG.
+                def _h_ex(k: str) -> float | None:
+                    svg = (cache.get(k) or {}).get("svg")
+                    dims = _svg_ex_dims(svg) if svg else None
+                    return dims[1] if dims else None
+
+                promote = {
+                    k for k, j in jobs.items()
+                    if not j["display"] and "text_html" not in j
+                    and (h := _h_ex(k)) is not None and h >= PROMOTE_INLINE_EX
+                }
+                # A promoted key's bitmap gets canvas padding (display
+                # treatment), which would wreck any occurrence that must
+                # stay inline — keep such keys fully inline instead.
+                blocked = set()
+                for line in md_text.split("\n"):
+                    if line.startswith(("#", "|", ">")) or re.match(
+                        r"\s*([-*+]|\d+\.)\s", line
+                    ):
+                        blocked.update(
+                            k for k in promote if f"⟂MATHI:{k}⟂" in line
+                        )
+                promote -= blocked
+                if promote:
+                    tok_re = re.compile(
+                        r"⟂MATHI:(?P<key>[0-9a-f]+)⟂"
+                        r"(?P<post>[。．，,；;、：:）)】\]]*)"
+                    )
+                    state = {"n": 0}
+
+                    def _promote_repl(m: re.Match) -> str:
+                        if m["key"] not in promote:
+                            return m.group(0)
+                        state["n"] += 1
+                        # paragraph split around the display token; trailing
+                        # punctuation stays on the formula line
+                        return f"\n\n⟂MATHD:{m['key']}⟂{m['post']}\n\n"
+
+                    md_text = tok_re.sub(_promote_repl, md_text)
+                    for k in promote:
+                        jobs[k]["display"] = True
+                    print(
+                        f"  promoted {state['n']} tall inline formulas "
+                        f"(>= {PROMOTE_INLINE_EX}ex) onto their own line"
+                    )
                 png_meta = render_pngs(
                     cache,
                     build_dir / "png_cache",
                     skip={k for k, j in jobs.items() if "text_html" in j},
+                    display_keys={k for k, j in jobs.items() if j["display"]},
+                    px_per_ex=cfg.get("png_px_per_ex", 8.0),
+                    canvas_px=cfg.get(
+                        "png_display_canvas_px", DISPLAY_CANVAS_PX
+                    ),
                 )
         md_out = build_dir / f"preprocessed.{mode}.md"
         md_out.write_text(md_text, encoding="utf-8")
@@ -1541,9 +1689,12 @@ def main(argv: list[str] | None = None) -> int:
                 md_text, out_epub, cover, hybrid_dir, cache, jobs,
                 png_meta=png_meta,
                 png_dir=build_dir / "png_cache" if png_meta is not None else None,
-                css_file=TOOL_DIR / "epub-png.css" if mode == "png" else None,
+                css_file=TOOL_DIR / "epub-png.css",
                 metadata_path=metadata_path,
                 px_per_ex=cfg.get("png_px_per_ex", 8.0),
+                canvas_px=cfg.get(
+                    "png_display_canvas_px", DISPLAY_CANVAS_PX
+                ),
             )
         report = build_report(out_epub, mode)
         reports.append(report)
