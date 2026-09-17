@@ -17,6 +17,16 @@ python3 validate.py <book.epub>                                       # 12 项�
 `flatten_svg.py --selftest`）从同一位置读取缓存：默认当前书目录，或
 `MD2EPUB_PROJECT` 环境变量 / 首个 CLI 参数覆盖。
 
+### 按书配置
+
+`--config` 指定书籍专属启发式与断言（默认 `book_config.json` = 数学分析第三版上册；
+`book_config_xinjiang_v1.json` = 数学分析新讲第一册）。可覆盖项：章节识别
+（`chapter_regex`）、正文起点注入 H1（`body_start_h1`，用于篇标题页只存在于扫描图
+而 MinerU 未输出标题的情况）、TOC 级 §/附录保留前缀（`keep_h2_prefixes` 列表）、
+垃圾标题模式、期望计数（H1/§/公式数，全部精确断言）、`book_name`（epub 文件名，
+缺省取 md 文件名）、以及内嵌 `metadata`（书名/作者/uuid，转储到构建目录供 pandoc）。
+预处理基线在删除前言/纸质目录**之后**统计（被删部分可能含公式，如"符号说明"页）。
+
 依赖：pandoc ≥ 3.x、node（svg/png 模式，需先在本目录 `npm install`）、
 rsvg-convert（png 模式，`brew install librsvg`）、PyYAML + PIL、pdftoppm、xmllint。
 

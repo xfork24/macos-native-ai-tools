@@ -23,6 +23,9 @@ XHTML_NS = "{http://www.w3.org/1999/xhtml}"
 EPUB_NS = "{http://www.idpf.org/2007/ops}"
 MIMETYPE = "application/epub+zip"
 RESIDUAL_MATH_RE = re.compile(r"\$\$|\$[^$\n]{1,120}\$")
+# <annotation> re-encodes the original TeX inside MathML — its dollars are
+# data, not stray delimiters.
+MATHML_ANNOTATION_RE = re.compile(r"<annotation[^>]*>.*?</annotation>", re.S)
 # pandoc's fallback for unconvertible TeX: <span class="math …">$…$</span>
 MATH_FALLBACK_RE = re.compile(
     r'<span class="math[^"]*">.*?</span>', re.S
@@ -131,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             # pandoc's raw-TeX fallback spans are counted separately; only
             # delimiters outside them mean a formula was silently lost.
             fallback_spans += len(MATH_FALLBACK_RE.findall(text))
-            stripped = MATH_FALLBACK_RE.sub(" ", text)
+            stripped = MATH_FALLBACK_RE.sub(" ", MATHML_ANNOTATION_RE.sub(" ", text))
             if RESIDUAL_MATH_RE.search(strip_tags(stripped)):
                 residual += 1
             base = str(PurePosixPath(name).parent)

@@ -157,6 +157,10 @@ def _repair_latex(latex: str) -> str:
     latex = latex.replace(r"\textbf", r"\mathbf")
     latex = latex.replace(r"\textit", r"\mathit")
     latex = latex.replace(r"\emph", r"\mathit")
+    # Stray inline delimiters pasted inside a math body by OCR
+    # ("$$\(| \sin x | …$$") — texmath rejects them outright.
+    latex = re.sub(r"^\\\(\s*", "", latex)
+    latex = re.sub(r"\s*\\\)$", "", latex)
     return latex
 
 
@@ -186,7 +190,6 @@ def preprocess(text: str, cfg: dict) -> str:
     # 1c. Repair LaTeX that pandoc's texmath rejects (old-style font switches
     #     and unsupported no-op commands) so it converts to MathML cleanly.
     text = _apply_to_math(text, _repair_latex)
-    raw_counts = count_math(text)
 
     # 2. Drop everything before the first chapter header (front matter +
     #    printed TOC, both superseded by the epub title page and nav).
@@ -198,17 +201,26 @@ def preprocess(text: str, cfg: dict) -> str:
     if first_chapter is None:
         raise ConvertError("no chapter header found; cannot locate body start")
     lines = lines[first_chapter:]
+    # 2b. Optionally inject the body's opening H1 — when the part-title page
+    #    exists only as an image, MinerU emits the body starting directly
+    #    with that part's § sections and no header to anchor them under.
+    if cfg.get("body_start_h1"):
+        lines.insert(0, f"# {cfg['body_start_h1']}")
 
     # 3. Drop running printed-page labels ("印刷页 157" standalone lines).
     page_re = re.compile(cfg["page_label_regex"])
     lines = [line for line in lines if not page_re.match(line)]
     text = "\n".join(lines)
+    # Baseline AFTER the front-matter drop: discarded matter may itself
+    # contain math (e.g. a 符号说明 page), which must not trip the
+    # "preprocessing must not touch math" postcondition.
+    raw_counts = count_math(text)
 
     # 4. Header reclassification.
     promote = [re.compile(p) for p in cfg["promote_h1_patterns"]]
     junk = [re.compile(p) for p in cfg["junk_h2_patterns"]]
     normalize_h1 = re.compile(cfg["normalize_h1_space"])
-    keep_prefix = cfg["keep_h2_prefix"]
+    keep_prefixes = cfg.get("keep_h2_prefixes") or [cfg["keep_h2_prefix"]]
     out_lines = []
     for line in text.split("\n"):
         m1 = normalize_h1.match(line)
@@ -230,7 +242,7 @@ def preprocess(text: str, cfg: dict) -> str:
                 break
         if promoted:
             out_lines.append(f"# {promoted}")
-        elif line.startswith(keep_prefix):
+        elif any(line.startswith(p) for p in keep_prefixes):
             out_lines.append(line)  # real § section
         elif any(j.match(title) for j in junk) or (
             cfg["junk_h2_contains_html_tag"] and re.search(r"</?(sub|sup)>", title)
@@ -257,12 +269,16 @@ def preprocess(text: str, cfg: dict) -> str:
     exp = cfg["expected"]
     expected_h1 = exp["h1_count"] - (1 if cfg.get("colophon_enabled") else 0)
     h1 = sum(1 for line in text.split("\n") if re.match(r"^# ", line))
-    h2 = sum(1 for line in text.split("\n") if line.startswith(keep_prefix))
+    h2 = sum(
+        1
+        for line in text.split("\n")
+        if any(line.startswith(p) for p in keep_prefixes)
+    )
     if h1 != expected_h1:
         raise ConvertError(f"H1 count {h1} != expected {expected_h1}")
     if h2 != exp["h2_section_count"]:
         raise ConvertError(
-            f"'{keep_prefix}' section count {h2} != expected {exp['h2_section_count']}"
+            f"section count {h2} != expected {exp['h2_section_count']}"
         )
     print(f"  preprocess ok: H1={h1}, sections={h2}, math={post_counts}")
     return text
@@ -650,7 +666,8 @@ def make_cover(hybrid_dir: Path, build_dir: Path, cfg: dict) -> Path | None:
 
 
 def run_pandoc(
-    md_path: Path, mode: str, out_epub: Path, cover: Path | None, hybrid_dir: Path
+    md_path: Path, mode: str, out_epub: Path, cover: Path | None, hybrid_dir: Path,
+    metadata_path: Path | None = None,
 ) -> None:
     cmd = [
         "pandoc", str(md_path),
@@ -658,7 +675,7 @@ def run_pandoc(
         "--to", "epub3",
         "--split-level=2",
         "--toc", "--toc-depth=2",
-        "--metadata-file", str(TOOL_DIR / "metadata.yaml"),
+        "--metadata-file", str(metadata_path or TOOL_DIR / "metadata.yaml"),
         "--css", str(TOOL_DIR / "epub.css"),
         "--resource-path", ".",
         "--wrap=none",
@@ -717,10 +734,10 @@ def _md_fragment_to_xhtml(body_md: str, title: str) -> str:
     )
 
 
-def _read_metadata() -> dict:
+def _read_metadata(path: Path | None = None) -> dict:
     import yaml
 
-    meta = yaml.safe_load((TOOL_DIR / "metadata.yaml").read_text(encoding="utf-8"))
+    meta = yaml.safe_load((path or TOOL_DIR / "metadata.yaml").read_text(encoding="utf-8"))
     meta.setdefault("author", [])
     if isinstance(meta["author"], str):
         meta["author"] = [meta["author"]]
@@ -787,6 +804,7 @@ def build_epub_chunked(
     md_text: str, out_epub: Path, cover: Path | None, hybrid_dir: Path,
     cache: dict, jobs: dict, png_meta: dict | None = None,
     png_dir: Path | None = None, css_file: Path | None = None,
+    metadata_path: Path | None = None,
 ) -> None:
     """svg/png-mode assembly: pandoc per H1/H2 section, package the zip ourselves.
 
@@ -796,7 +814,7 @@ def build_epub_chunked(
     epub-png.css: bare-img CSS rules make ex-blind engines fall back to
     intrinsic bitmap size.
     """
-    meta = _read_metadata()
+    meta = _read_metadata(metadata_path)
     sections = _split_sections(md_text)
     # Transient staging in a fresh tempdir — never inside the tool repo, and
     # unique per run (no cleanup races).
@@ -1181,8 +1199,18 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out_dir or hybrid_dir.parent
     build_dir = hybrid_dir.parent / "md2epub-build"
     build_dir.mkdir(parents=True, exist_ok=True)
+    # Per-book metadata may live inline in the config (dumped to the build
+    # dir for pandoc) instead of the repo's default metadata.yaml.
+    metadata_path = TOOL_DIR / "metadata.yaml"
+    if isinstance(cfg.get("metadata"), dict):
+        import yaml
 
+        metadata_path = build_dir / "metadata.yaml"
+        metadata_path.write_text(
+            yaml.safe_dump(cfg["metadata"], allow_unicode=True), encoding="utf-8"
+        )
     md_path = find_md(hybrid_dir, cfg)
+    book_stem = cfg.get("book_name") or md_path.stem
     print(f"source md: {md_path.name} ({md_path.stat().st_size / 1e6:.2f} MB)")
     text = preprocess(md_path.read_text(encoding="utf-8"), cfg)
     if cfg.get("colophon_enabled"):
@@ -1238,9 +1266,9 @@ def main(argv: list[str] | None = None) -> int:
                 png_meta = render_pngs(cache, build_dir / "png_cache")
         md_out = build_dir / f"preprocessed.{mode}.md"
         md_out.write_text(md_text, encoding="utf-8")
-        out_epub = out_dir / f"{md_path.stem}.{mode}.epub"
+        out_epub = out_dir / f"{book_stem}.{mode}.epub"
         if mode == "mathml":
-            run_pandoc(md_out, mode, out_epub, cover, hybrid_dir)
+            run_pandoc(md_out, mode, out_epub, cover, hybrid_dir, metadata_path)
             mathml_epub = out_epub
         else:
             build_epub_chunked(
@@ -1248,6 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
                 png_meta=png_meta,
                 png_dir=build_dir / "png_cache" if png_meta is not None else None,
                 css_file=TOOL_DIR / "epub-png.css" if mode == "png" else None,
+                metadata_path=metadata_path,
             )
         report = build_report(out_epub, mode)
         reports.append(report)
@@ -1258,7 +1287,7 @@ def main(argv: list[str] | None = None) -> int:
     if "mathml" not in log_modes:
         # A png/svg-only run must not lose the mathml section of the log:
         # parse the mathml epub built by an earlier run in this directory.
-        existing = out_dir / f"{md_path.stem}.mathml.epub"
+        existing = out_dir / f"{book_stem}.mathml.epub"
         if existing.exists():
             mathml_epub = existing
             log_modes.append("mathml")

@@ -1,0 +1,37 @@
+{
+  "md_glob": "*.md",
+  "origin_pdf_glob": "*_origin.pdf",
+  "book_name": "数学分析新讲（第一册）",
+  "colophon_enabled": true,
+  "colophon_md": "# 关于本电子书\n\n本书由 OCR 工具从扫描版自动转换生成（2026-09-17），公式与文字可能存在识别错误，仅供个人学习使用。\n",
+  "chapter_regex": "^#+\\s*§",
+  "body_start_h1": "预篇 准备知识",
+  "promote_h1_patterns": [
+    "^## (第[一二三四五六七八九十]+章.*)",
+    "^## (重排本说明)\\s*$"
+  ],
+  "normalize_h1_space": "^# (第[一二三四五六七八九十]+章)(\\S)",
+  "keep_h2_prefixes": ["## § ", "## 附录"],
+  "junk_h2_patterns": [
+    "^定理\\d",
+    "^解\\s",
+    "^[（(]\\d+[）)]"
+  ],
+  "junk_h2_contains_html_tag": true,
+  "page_label_regex": "^\\s*印刷页\\s*\\d+\\s*$",
+  "expected": {
+    "h1_count": 10,
+    "h2_section_count": 39,
+    "display_math": 1914,
+    "inline_math": 4298,
+    "nav_top_level": 10,
+    "nav_leaves": 49
+  },
+  "metadata": {
+    "title": "数学分析新讲（第一册）",
+    "author": ["张筑生"],
+    "lang": "zh-CN",
+    "date": "2026-09-17",
+    "identifier": "urn:uuid:94adc669-8bbf-404b-8b2a-e3ea63af364f"
+  }
+}
