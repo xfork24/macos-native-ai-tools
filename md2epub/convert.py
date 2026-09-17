@@ -36,6 +36,10 @@ DEFAULTS = {
         "本书由 OCR 工具从扫描版自动转换生成，公式与文字可能存在识别错误，"
         "仅供个人学习使用。\n"
     ),
+    # PNG formula sizing: every px fallback value (native width/height attrs
+    # and the px CSS declarations) = ex value * this factor. 8 ≈ 1ex of a
+    # 16px body font. Per-book override for device calibration (imgtest4).
+    "png_px_per_ex": 8.0,
     "chapter_regex": r"^#+\s*第[一二三四五六七八九十]+章",
     "promote_h1_patterns": [
         r"^## (第[一二三四五六七八九十]+章.*)",
@@ -423,7 +427,8 @@ def render_math_via_node(
 
 
 def inject_svg_math(
-    xhtml: str, cache: dict, jobs: dict, png_meta: dict | None = None
+    xhtml: str, cache: dict, jobs: dict, png_meta: dict | None = None,
+    px_per_ex: float = 8.0,
 ) -> str:
     """Substitute tokens in a pandoc-produced XHTML fragment with math HTML.
 
@@ -444,20 +449,30 @@ def inject_svg_math(
         w_ex, h_ex = png_meta[key]
         alt = html.escape(jobs[key]["latex"], quote=True)
         src = f"../media/eq-{key}.png"
-        # Native width/height attributes (1ex≈8px) are the fallback for engines
-        # that ignore inline CSS (iReader displays raw intrinsic px otherwise);
-        # CSS-capable readers prefer the ex-unit style and scale with font size.
-        w_px, h_px = round(w_ex * 8), round(h_ex * 8)
+        # Dual-unit cascade, px first / ex second. Full-CSS engines keep
+        # font-size scaling (ex wins the cascade); ex-blind engines (iReader,
+        # Kindle) drop the ex declaration and fall back to the px value — the
+        # same numbers the native width/height attributes carry, so every
+        # fallback path renders the same size, and vertical-align finally
+        # has a real value on engines that ignore ex.
+        w_px, h_px = round(w_ex * px_per_ex), round(h_ex * px_per_ex)
         if display:
+            # Width AND height in dual units so scaling engines grow both by
+            # the same factor (aspect preserved). Never height:auto — it is a
+            # valid keyword even on ex-blind engines and would restore the
+            # intrinsic 2x bitmap size.
             return (
                 f'<img src="{src}" width="{w_px}" height="{h_px}" '
-                f'style="width:{w_ex}ex" alt="{alt}"/>'
+                f'style="width:{w_px}px;width:{w_ex}ex;'
+                f'height:{h_px}px;height:{h_ex}ex" alt="{alt}"/>'
             )
         valign = (cache.get(key) or {}).get("valign_ex", 0)
+        v_px = round(valign * px_per_ex)
         return (
             f'<img class="math-inline" src="{src}" '
             f'width="{w_px}" height="{h_px}" '
-            f'style="height:{h_ex}ex;vertical-align:{valign}ex" alt="{alt}"/>'
+            f'style="height:{h_px}px;height:{h_ex}ex;'
+            f'vertical-align:{v_px}px;vertical-align:{valign}ex" alt="{alt}"/>'
         )
 
     def display_block(key: str) -> str:
@@ -804,7 +819,7 @@ def build_epub_chunked(
     md_text: str, out_epub: Path, cover: Path | None, hybrid_dir: Path,
     cache: dict, jobs: dict, png_meta: dict | None = None,
     png_dir: Path | None = None, css_file: Path | None = None,
-    metadata_path: Path | None = None,
+    metadata_path: Path | None = None, px_per_ex: float = 8.0,
 ) -> None:
     """svg/png-mode assembly: pandoc per H1/H2 section, package the zip ourselves.
 
@@ -863,7 +878,7 @@ def build_epub_chunked(
             return f'<img class="figure-img" src="{src}"{dims} />'
 
         xhtml = re.sub(r'<img src="(\.\./media/(img\d+\.[^"]+))" */>', _augment, xhtml)
-        xhtml = inject_svg_math(xhtml, cache, jobs, png_meta)
+        xhtml = inject_svg_math(xhtml, cache, jobs, png_meta, px_per_ex)
         if png_meta is not None and png_dir is not None:
             for name in set(
                 re.findall(r'src="\.\./media/(eq-[0-9a-f]+\.png)"', xhtml)
@@ -956,6 +971,21 @@ def build_epub_chunked(
     )
     if cover_page:
         spine = '<itemref idref="cover-page"/>' + spine
+    # EPUB2-era legacy markers: older engines (and calibre's cover sniffing)
+    # locate the cover via meta[name=cover]/guide instead of properties.
+    # epubcheck flags guide as deprecated in EPUB3 — harmless, mainstream
+    # publishing tooling still emits it for exactly this compat reason.
+    legacy_cover_meta = (
+        '<meta name="cover" content="cover-image"/>\n' if cover is not None else ""
+    )
+    guide = (
+        "<guide>\n"
+        f'<reference type="cover" title="封面" href="text/{cover_page}"/>\n'
+        '<reference type="toc" title="目录" href="nav.xhtml"/>\n'
+        "</guide>\n"
+        if cover_page
+        else ""
+    )
     opf = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
@@ -969,9 +999,11 @@ def build_epub_chunked(
         + f'<dc:language>{html.escape(meta.get("lang", "zh-CN"))}</dc:language>\n'
         f'<dc:date>{html.escape(str(meta.get("date", "")))}</dc:date>\n'
         f'<meta property="dcterms:modified">{now}</meta>\n'
+        f"{legacy_cover_meta}"
         "</metadata>\n"
         f"<manifest>{''.join(manifest)}</manifest>\n"
         f'<spine toc="ncx">{spine}</spine>\n'
+        f"{guide}"
         "</package>\n"
     )
     (staging / "EPUB" / "content.opf").write_text(opf, encoding="utf-8")
@@ -1277,6 +1309,7 @@ def main(argv: list[str] | None = None) -> int:
                 png_dir=build_dir / "png_cache" if png_meta is not None else None,
                 css_file=TOOL_DIR / "epub-png.css" if mode == "png" else None,
                 metadata_path=metadata_path,
+                px_per_ex=cfg.get("png_px_per_ex", 8.0),
             )
         report = build_report(out_epub, mode)
         reports.append(report)

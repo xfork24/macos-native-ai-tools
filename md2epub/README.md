@@ -24,7 +24,8 @@ python3 validate.py <book.epub>                                       # 12 项�
 （`chapter_regex`）、正文起点注入 H1（`body_start_h1`，用于篇标题页只存在于扫描图
 而 MinerU 未输出标题的情况）、TOC 级 §/附录保留前缀（`keep_h2_prefixes` 列表）、
 垃圾标题模式、期望计数（H1/§/公式数，全部精确断言）、`book_name`（epub 文件名，
-缺省取 md 文件名）、以及内嵌 `metadata`（书名/作者/uuid，转储到构建目录供 pandoc）。
+缺省取 md 文件名）、png 尺寸兜底系数 `png_px_per_ex`（默认 8.0，设备校准用）、
+以及内嵌 `metadata`（书名/作者/uuid，转储到构建目录供 pandoc）。
 预处理基线在删除前言/纸质目录**之后**统计（被删部分可能含公式，如"符号说明"页）。
 
 依赖：pandoc ≥ 3.x、node（svg/png 模式，需先在本目录 `npm install`）、
@@ -37,7 +38,7 @@ rsvg-convert（png 模式，`brew install librsvg`）、PyYAML + PIL、pdftoppm�
 | 体积 | 2.0 MB | 8.1 MB | 14.8 MB |
 | 渲染 | 阅读器原生 MathML | 内联 `<svg>` 元素 | `<img>` 引用 2× 32 色调色板 PNG |
 | 适用 | Apple Books、Thorium、Calibre 等支持 MathML 的阅读器 | 支持内联 SVG 的现代阅读器（Calibre/KOReader 实测正常） | **不支持内联 SVG 的引擎（掌阅 iReader 等国产电纸书）——位图是 EPUB 强制支持项，必然能显示** |
-| 缺点 | 绝大多数电纸书不支持（会显示成 LaTeX 原文） | iReader 等不渲染内联 SVG | 仍有体积、放大有像素；ex 单位 CSS 尺寸仍随字号缩放 |
+| 缺点 | 绝大多数电纸书不支持（会显示成 LaTeX 原文） | iReader 等不渲染内联 SVG | 仍有体积、放大有像素；完整 CSS 引擎上尺寸仍随字号缩放 |
 
 三版内容完全相同（同一预处理、同一目录：11 个顶层条目 / 43 个文件）。
 在目标设备上各试一章后选用；iReader 这类设备直接用 png 版。
@@ -60,6 +61,37 @@ Qt/MuPDF 等引擎均支持）比灰度+alpha 小约 4×——45 MB → 14.8 MB�
 `width="100%"` 拉伸表格公式（分段函数等）此前误用嵌套 viewBox（宽度=1）
 推算宽高比，被栅格成 8px 畸图——现改为 rsvg 实测墨迹宽高比（探测宽度
 无关，稳定 ±1%）。
+
+### png 模式：跨设备尺寸兜底（px 先行 / ex 兜底双单位级联）
+
+设备事实：掌阅 iReader 等弱 CSS 引擎**忽略 ex 单位**（整条声明丢弃 → 公式
+尺寸落回原生 width/height 属性、行内 vertical-align 完全丢失）；Kindle azw3
+同理只认 px。而 Calibre/KOReader 等完整引擎上 ex 随字号缩放是既有优点，
+不能破坏。方案是每条尺寸声明写两遍，**px 在前、ex 在后**：
+
+```html
+<img class="math-inline" … width="90" height="16"
+     style="height:16px;height:2.034ex;vertical-align:-4px;vertical-align:-0.464ex"/>
+<img src="…display…" width="141" height="22"
+     style="width:141px;width:17.611ex;height:22px;height:2.791ex"/>
+```
+
+级联规则天然分流：完整引擎 ex 覆盖 px（字号缩放保留，好平台零回归）；
+ex 盲引擎丢弃 ex 声明、px 生效——与原生属性同源同值，任何兜底路径渲染
+同一尺寸，行内对齐也首次在掌阅生效。行间公式宽高都写双单位（同因子
+缩放，纵横比恒定；不用 `height:auto`——它在 ex 盲引擎上是合法关键字，
+会回到位图固有 2× 尺寸）。px 值 = ex × `png_px_per_ex`（默认 8，即 16px
+正文；按书/按设备可在 config 覆盖，校准方法见下）。
+
+OPF 同时带 EPUB2 遗产标记（`<meta name="cover">` + `<guide>` cover/toc
+reference）——老引擎与 calibre 的封面嗅探走这条路；epubcheck 会警告
+guide 已弃用，无害。
+
+**校准（公式显示测试4.epub，`build_imgtest4.py`）**：A 现状基线 / B 双单位
+级联 / C 纯 px（隔离"引擎认不认 CSS px"）/ D B+`align="absmiddle"` 属性 /
+E7–E10 系数 k / F 宽公式溢出。设备回报字母后：若最佳行是 E_k 则把
+`png_px_per_ex` 设为 k 重建；若 D 行对齐明显更好则考虑给行内 img 加
+align 属性；F 决定宽公式是否封顶。
 
 ### png 模式：按公式复杂度智能选择渲染样式
 
