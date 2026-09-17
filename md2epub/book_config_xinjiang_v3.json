@@ -1,0 +1,41 @@
+{
+  "md_glob": "*.md",
+  "origin_pdf_glob": "*_origin.pdf",
+  "book_name": "数学分析新讲（第三册）",
+  "colophon_enabled": true,
+  "colophon_md": "# 关于本电子书\n\n本书由 OCR 工具从扫描版自动转换生成（2026-09-17），公式与文字可能存在识别错误，仅供个人学习使用。\n",
+  "chapter_regex": "^#+\\s*第[一二三四五六七八九十]+章",
+  "body_start_h1": "第五篇 曲线、曲面与微积分",
+  "text_replacements": [
+    ["## 第六篇\n\n## 级数与含参变元的积分", "## 第六篇 级数与含参变元的积分"]
+  ],
+  "promote_h1_patterns": [
+    "^## (第[一二三四五六七八九十]+[篇章].*)",
+    "^## (后记)\\s*$",
+    "^## (重排本说明)\\s*$"
+  ],
+  "normalize_h1_space": "^# (第[一二三四五六七八九十]+章)(\\S)",
+  "keep_h2_prefixes": ["## § ", "## 附录"],
+  "junk_h2_patterns": [
+    "^定理\\d",
+    "^解\\s",
+    "^[（(]\\d+[）)]"
+  ],
+  "junk_h2_contains_html_tag": true,
+  "page_label_regex": "^\\s*印刷页\\s*\\d+\\s*$",
+  "expected": {
+    "h1_count": 13,
+    "h2_section_count": 45,
+    "display_math": 2525,
+    "inline_math": 3996,
+    "nav_top_level": 13,
+    "nav_leaves": 58
+  },
+  "metadata": {
+    "title": "数学分析新讲（第三册）",
+    "author": ["张筑生"],
+    "lang": "zh-CN",
+    "date": "2026-09-17",
+    "identifier": "urn:uuid:54a202b5-fd65-4af3-89c5-c462be061278"
+  }
+}

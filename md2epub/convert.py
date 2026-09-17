@@ -37,12 +37,19 @@ DEFAULTS = {
         "本书由 OCR 工具从扫描版自动转换生成，公式与文字可能存在识别错误，"
         "仅供个人学习使用。\n"
     ),
+    # Per-book literal text repairs: ordered [from, to] substring replacements
+    # applied before math normalization — e.g. raw "a<b 或是 a>b" in prose,
+    # which pandoc parses as a pseudo-HTML tag (<b 或是 a>) and passes through
+    # verbatim, producing malformed XHTML.
+    "text_replacements": [],
     # PNG formula sizing: every px fallback value (native width/height attrs
     # and the px CSS declarations) = ex value * this factor. 8 ≈ 1ex of a
     # 16px body font. Per-book override for device calibration (imgtest4).
     "png_px_per_ex": 8.0,
-    # Display-bitmap canvas width in bitmap px (see DISPLAY_CANVAS_PX):
-    # calibrates on-device glyph size on aspect-stretching engines.
+    # Display-bitmap canvas width, calibrated in RASTER_SCALE-density px
+    # (see DISPLAY_CANVAS_PX — the physical bitmap is this times
+    # DISPLAY_RASTER_SCALE/RASTER_SCALE): calibrates on-device glyph size
+    # on aspect-stretching engines.
     "png_display_canvas_px": 720,
     "chapter_regex": r"^#+\s*第[一二三四五六七八九十]+章",
     "promote_h1_patterns": [
@@ -165,6 +172,15 @@ def _repair_latex(latex: str) -> str:
     latex = latex.replace(r"\textbf", r"\mathbf")
     latex = latex.replace(r"\textit", r"\mathit")
     latex = latex.replace(r"\emph", r"\mathit")
+    # Runs of 3+ thin-space commands are OCR blank noise ("\|\cdot\|\,\,\,…"
+    # once rasterised as a 3097ex-wide box); collapse to one thin space.
+    latex = re.sub(r"(?:\\[,;:]\s*){3,}", r"\\, ", latex)
+    # Printed margin equation numbers dragged into the formula ("\tag{1.2}"):
+    # page furniture, not mathematics. MathJax answers \tag with a
+    # width="100%" full-line table (no root viewBox — unsizable for
+    # rasterisation, the probe renders it at internal scale and the bitmap
+    # collapses to a vertical sliver), and texmath rejects \tag outright.
+    latex = re.sub(r"\\tag\s*\{[^{}]*\}", "", latex)
     # Stray inline delimiters pasted inside a math body by OCR
     # ("$$\(| \sin x | …$$") — texmath rejects them outright.
     latex = re.sub(r"^\\\(\s*", "", latex)
@@ -190,6 +206,10 @@ def preprocess(text: str, cfg: dict) -> str:
     text = text.replace("\x00", "")
     if "\x00" in text:
         raise ConvertError(f"{text.count(chr(0))} NUL bytes remain after repair")
+
+    # 1a. Per-book literal text repairs (see DEFAULTS["text_replacements"]).
+    for old, new in cfg.get("text_replacements") or []:
+        text = text.replace(old, new)
 
     # 1b. Normalize inline-math delimiters BEFORE taking the baseline count:
     #     whitespace inside "$…$" would make pandoc treat the span as plain
@@ -380,17 +400,27 @@ FLIP_INLINE_MIN_H_EX = 3.0
 # (Two earlier approaches are dead: px box-capping (iReader clamps it to a
 # text line) and strip-splitting bitmaps (cuts tore fractions apart).)
 FALLBACK_BOX_PX = (380, 44)  # inline-only px height cap
-DISPLAY_CANVAS_PX = 720  # display bitmap canvas width (bitmap px)
+# display bitmap canvas width, in RASTER_SCALE-density px (the physical
+# bitmap is DISPLAY_RASTER_SCALE/RASTER_SCALE times this — see render_pngs)
+DISPLAY_CANVAS_PX = 720
 PROMOTE_INLINE_EX = 4.8  # taller inline formulas go on their own line
+# Inline formulas wider than a full text line can never share one: every
+# wrapping engine squeezes them horizontally to fit (iReader clamps the
+# line box; KOReader 压宽保高) — re-flow them like the tall ones.
+PROMOTE_INLINE_W_EX = 36.0
 # Wide display formulas are re-flowed into aligned multi-line LaTeX so no
 # single line is width-capped down to unreadable glyphs (a 90ex chain capped
 # to 420px shows its characters at under half body size).
 WIDE_SPLIT_EX = 46.0
 WIDE_SPLIT_LINE_EX = 44.0
-# Complex (tall) inline formulas get their px fallbacks boosted so their
-# inner glyphs stay legible on px-only engines; ex values stay true.
-INLINE_BOOST_EX = 3.0
-INLINE_BOOST = 1.3
+# px fallback heights for inline formulas are banded, not proportional: on
+# ex-blind engines a 12px neighbour next to a 23px one reads as random size
+# jitter (worst inside enumerated lists — device report "同一个列表有大有小").
+# Bands snap near-equal formulas to identical boxes; edges (1.8/2.65/3.5ex)
+# sit in the natural gaps of this book's ink-height distribution,
+# px = px_per_ex * band value. ex stays true, so full-CSS engines keep
+# proportional scaling.
+INLINE_PX_BANDS = ((1.8, 1.9), (2.65, 2.4), (3.5, 3.0), (float("inf"), 4.0))
 
 # Trivial single-token formulas (x, \alpha, x_n, f') render as plain HTML
 # text instead of bitmaps: image-unfriendly engines enforce a minimum inline
@@ -465,8 +495,23 @@ _RELATIONS = (
     "=", "<", ">",
 )
 _REL_RE = re.compile("|".join(re.escape(r) for r in _RELATIONS))
-_OPEN_DELIMS = ("\\left", "\\bigl", "\\biggl", "\\Bigl", "\\big", "\\Big")
-_CLOSE_DELIMS = ("\\right", "\\bigr", "\\biggr", "\\Bigr")
+# l/r-suffixed size modifiers open/close a stretched group; the BARE forms
+# (\big, \Big, …) only size the following delimiter and carry no pairing —
+# counting them as openers made every closing \Big) raise the depth and
+# wrecked the phantom-wrap counts (device round: stray \right. -> MathJax
+# "Missing \left or extra \right").
+_OPEN_DELIMS = (
+    "\\left", "\\bigl", "\\Bigl", "\\biggl", "\\Biggl",
+)
+_CLOSE_DELIMS = ("\\right", "\\bigr", "\\Bigr", "\\biggr", "\\Biggr")
+
+
+# Secondary break tokens for _break_row (see _break_cuts): standard
+# typesetting breaks before binary +/- and at \quad clause separators.
+_OP_BREAK_RE = re.compile(r"\+|-|\\quad")
+# Term-starting commands: juxtaposed factor chains (nested integrals, sums)
+# carry no operators between factors — the factor start is the break point.
+_TERM_START_RE = re.compile(r"\\(?:i{1,3}nt|sum|prod|lim)")
 
 
 def _depth0_relations(latex: str) -> list[int]:
@@ -482,7 +527,7 @@ def _depth0_relations(latex: str) -> list[int]:
             i += 1
         elif c == "\\":
             m = re.match(r"\\[a-zA-Z]+", latex[i:])
-            if not m:  # \\, \\; etc. — skip both chars
+            if not m:  # \\, \; etc. — skip both chars
                 i += 2
                 continue
             name = m.group(0)
@@ -490,6 +535,8 @@ def _depth0_relations(latex: str) -> list[int]:
                 depth += 1
             elif name in _CLOSE_DELIMS:
                 depth = max(0, depth - 1)
+            elif depth == 0 and _REL_RE.match(latex, i):
+                cuts.append(i)  # command-form relation (\\leq, \\Rightarrow…)
             i += len(m.group(0))
         elif depth == 0:
             m = _REL_RE.match(latex, i)
@@ -503,36 +550,185 @@ def _depth0_relations(latex: str) -> list[int]:
     return cuts
 
 
-def _split_wide_latex(latex: str, w_ex: float) -> str | None:
-    """Re-flow an over-wide single-line equation into an aligned block.
+# Row-structured display latex: source \begin{array}{r l} chains ("A \\ & = B"),
+# our own earlier aligned re-flows, bare multi-line bodies. Other or nested
+# environments (cases/matrix — absent in this corpus) are left untouched.
+_ROW_ENV_RE = re.compile(
+    r"^\\begin\{(array|aligned)\}\s*(?:\{[^{}]*\})?\s*(.*?)\s*\\end\{\1\}$",
+    re.S,
+)
 
-    Breaks BEFORE depth-0 relations (each continuation line starts with its
-    =/≤/⇒, &-aligned like standard math continuation typesetting). Returns
-    None when the formula is already multi-line or offers no usable break.
+
+def _latex_rows(latex: str) -> list[str] | None:
+    """Row contents ('&' dropped, whitespace squeezed); None for latex we
+    do not re-flow (other/nested environments)."""
+    text = latex.strip()
+    m = _ROW_ENV_RE.match(text)
+    if m:
+        body = m.group(2)
+        if "\\begin{" in body:
+            return None  # nested environment inside — leave the whole formula
+    elif "\\begin{" not in text:
+        body = text
+    else:
+        return None
+    rows = []
+    for r in re.split(r"\\\\|\n", body):
+        r = re.sub(r"\s+", " ", r.replace("&", " ")).strip()
+        if r:
+            rows.append(r)
+    return rows or None
+
+
+def _break_cuts(row: str) -> list[tuple[int, int]]:
+    """(offset, wrap) break candidates for _break_row.
+
+    Depth-0 relations (wrap 0) plus secondary tokens — +/-, \\quad,
+    term-starting \\int/\\sum/\\lim — at BRACE depth 0. Secondary cuts are
+    allowed inside open \\left-class delimiters; wrap records the delimiter
+    nesting there, and the split re-issues phantom pairs (\\right. closes
+    the upper line, \\left. opens the continuation) — the same idiom the
+    book's own print uses for bracketed expansions broken across lines.
     """
-    if "\\begin{" in latex or "\n" in latex or "&" in latex:
-        return None
-    n_lines = max(2, math.ceil(w_ex / WIDE_SPLIT_LINE_EX))
-    cuts = _depth0_relations(latex)
-    if len(cuts) < n_lines - 1:
-        return None
-    chosen: list[int] = []
+    cuts: list[tuple[int, int]] = []
+    brace = delim = 0
+    i, n = 0, len(row)
+    while i < n:
+        c = row[i]
+        if c == "{":
+            brace += 1
+            i += 1
+        elif c == "}":
+            brace = max(0, brace - 1)
+            i += 1
+        elif c == "\\":
+            m = re.match(r"\\[a-zA-Z]+", row[i:])
+            if not m:  # \\, \; etc. — skip both chars
+                i += 2
+                continue
+            name = m.group(0)
+            if name in _OPEN_DELIMS:
+                delim += 1
+            elif name in _CLOSE_DELIMS:
+                delim = max(0, delim - 1)
+            elif brace == 0 and (
+                _REL_RE.match(row, i)
+                or _OP_BREAK_RE.match(row, i)
+                or _TERM_START_RE.match(row, i)
+            ):
+                cuts.append((i, delim))
+            i += len(m.group(0))
+        elif brace == 0:
+            m = _REL_RE.match(row, i)
+            if m:
+                cuts.append((i, delim))
+                i += len(m.group(0))
+            elif _OP_BREAK_RE.match(row, i):
+                cuts.append((i, delim))
+                i += 1
+            else:
+                i += 1
+        else:
+            i += 1
+    return cuts
+
+
+def _break_row(row: str, w_ex: float) -> list[str]:
+    """Break one over-wide row before depth-0 relations or secondary break
+    tokens (continuation pieces keep their leading operator; cuts inside
+    \\left…\\right spans get phantom-pair wrapping — see _break_cuts).
+    Unsplittable rows come back whole."""
+    if "\\begin{" in row:
+        return [row]
+    n_lines = max(2, math.ceil(w_ex / (WIDE_SPLIT_LINE_EX - 2.0)))
+    cands = _break_cuts(row)
+    if len(cands) < n_lines - 1:
+        return [row]
+    chosen: list[tuple[int, int]] = []
     for t in range(1, n_lines):
-        target = len(latex) * t / n_lines
-        floor = chosen[-1] if chosen else 0
-        cands = [c for c in cuts if c > floor]
-        if not cands:
-            return None
-        chosen.append(min(cands, key=lambda c: abs(c - target)))
-    parts, prev = [], 0
-    for c in chosen:
-        parts.append(latex[prev:c])
-        prev = c
-    parts.append(latex[prev:])
-    # parts[1:] each start with the relation; & marks the alignment column.
-    lines = [parts[0].rstrip() + " & " + parts[1].lstrip()]
-    lines += ["& " + p.lstrip() for p in parts[2:]]
-    return "\\begin{aligned}\n" + " \\\\\n".join(lines) + "\n\\end{aligned}"
+        target = len(row) * t / n_lines
+        floor = chosen[-1][0] if chosen else 0
+        avail = [c for c in cands if c[0] > floor]
+        if not avail:
+            return [row]
+        chosen.append(min(avail, key=lambda c: abs(c[0] - target)))
+    # A boundary flanked by break tokens on one side yields a segment with
+    # no content — deactivate that boundary (merge across it) rather than
+    # emit a junk aligned row. Boundary i sits between segments i and i+1.
+    seg_texts = [row[0:chosen[0][0]]] if chosen else [row]
+    for k in range(1, len(chosen)):
+        seg_texts.append(row[chosen[k - 1][0]:chosen[k][0]])
+    if chosen:
+        seg_texts.append(row[chosen[-1][0]:])
+    active = [True] * len(chosen)
+    for i, seg in enumerate(seg_texts):
+        if seg.strip() and not re.fullmatch(r"(?:\+|-|\\quad|\s)*", seg):
+            continue
+        if i > 0:
+            active[i - 1] = False
+        elif len(chosen) > 0:
+            active[0] = False
+    bounds = [c for k, c in enumerate(chosen) if active[k]]
+    parts: list[str] = []
+    prev = 0
+    for pos, wrap in bounds:
+        parts.append(row[prev:pos].strip())
+        prev = pos
+    parts.append(row[prev:].strip())
+    out: list[str] = []
+    for k, part in enumerate(parts):
+        if not part or re.fullmatch(r"(?:\+|-|\\quad|\s)*", part):
+            continue  # boundary deactivation left it empty
+        if k > 0 and k - 1 < len(bounds):
+            part = "\\left." * bounds[k - 1][1] + part
+        if k < len(bounds):
+            part = part + "\\right." * bounds[k][1]
+        out.append(part)
+    return out
+
+
+def _align_line(line: str) -> str:
+    """Put the alignment & before the line's first depth-0 relation."""
+    cuts = _depth0_relations(line)
+    if not cuts:
+        return line
+    c = cuts[0]
+    head, tail = line[:c].rstrip(), line[c:].lstrip()
+    return f"{head} & {tail}" if head else f"& {tail}"
+
+
+def _split_wide_latex(latex: str, w_ex: float) -> str | None:
+    """Re-flow an over-wide display equation into an aligned block whose
+    lines each fit WIDE_SPLIT_LINE_EX.
+
+    Row-structured latex (see _ROW_ENV_RE) is handled row by row: each row
+    is measured proportionally to the longest one and broken before
+    depth-0 relations exactly like a plain line. Returns None when the
+    formula offers no usable re-flow.
+    """
+    rows = _latex_rows(latex)
+    if rows is None:
+        return None
+    longest = max(len(r) for r in rows)
+    lines: list[str] = []
+    for row in rows:
+        row_w = w_ex * len(row) / longest
+        lines += _break_row(row, row_w) if row_w > WIDE_SPLIT_LINE_EX else [row]
+    if len(lines) == 1:
+        return None  # single row that refused to break
+    # Safety net: a cutter bug that unbalances \left/\right pairs would turn
+    # the formula into a raw-TeX fallback (worse than a shrunk bitmap) —
+    # refuse the re-flow instead. Cross-row source phantoms (\right. on one
+    # line, \left. on the next) still balance over the whole block.
+    n_open = len(re.findall(r"\\(?:left|bigl|Bigl|biggl|Biggl)\b", " ".join(lines)))
+    n_close = len(re.findall(r"\\(?:right|bigr|Bigr|biggr|Biggr)\b", " ".join(lines)))
+    if n_open != n_close:
+        return None
+    row_sep = " \\\\" + "\n"  # LaTeX row break (" \\ "), then newline
+    return (
+        "\\begin{aligned}\n" + row_sep.join(_align_line(ln) for ln in lines)
+        + "\n\\end{aligned}"
+    )
 
 
 def _split_wide_formulas(
@@ -543,29 +739,168 @@ def _split_wide_formulas(
     Runs after the first render + style flips: only formulas still wider
     than WIDE_SPLIT_EX at that point are re-flowed, re-rendered under a new
     key (hash of the aligned LaTeX — deterministic, so reruns are idempotent)
-    and the tokenised markdown is re-pointed at the new key.
+    and the tokenised markdown is re-pointed at the new key. The loop runs
+    twice: each round measures the ACTUAL render, so a char-proportional
+    row estimate that left a line over-wide gets a second, better-informed
+    cut. Unsplittable formulas keep the aspect-shrunk box fallback.
     """
-    todo: dict[str, dict] = {}
-    for key, job in list(jobs.items()):
-        if "text_html" in job or not job["display"]:
-            continue
-        entry = cache.get(key) or {}
-        dims = _svg_ex_dims(entry["svg"]) if "svg" in entry else None
-        if not dims or dims[0] <= WIDE_SPLIT_EX:
-            continue
-        new_latex = _split_wide_latex(job["latex"], dims[0])
-        if not new_latex:
-            continue
-        new_key = _hash(new_latex)
-        md_text = md_text.replace(f"⟂MATHD:{key}⟂", f"⟂MATHD:{new_key}⟂")
-        todo[new_key] = {"latex": new_latex, "display": True}
-        del jobs[key]
-    if not todo:
-        return md_text, jobs, cache
-    print(f"  wide-split: re-flowed {len(todo)} long equations into aligned lines")
-    cache, _ = render_math_via_node(todo, build_dir, build_dir / "math_cache.json")
-    jobs.update(todo)
+    total = 0
+    for _round in range(2):
+        todo: dict[str, dict] = {}
+        for key, job in list(jobs.items()):
+            if "text_html" in job or not job["display"]:
+                continue
+            entry = cache.get(key) or {}
+            dims = _svg_ex_dims(entry["svg"]) if "svg" in entry else None
+            if not dims or dims[0] <= WIDE_SPLIT_EX:
+                continue
+            new_latex = _split_wide_latex(job["latex"], dims[0])
+            if not new_latex or new_latex == job["latex"]:
+                continue
+            new_key = _hash(new_latex)
+            md_text = md_text.replace(
+                f"⟂MATHD:{key}⟂", f"⟂MATHD:{new_key}⟂"
+            )
+            todo[new_key] = {"latex": new_latex, "display": True}
+            del jobs[key]
+        if not todo:
+            break
+        total += len(todo)
+        cache, _ = render_math_via_node(
+            todo, build_dir, build_dir / "math_cache.json"
+        )
+        jobs.update(todo)
+    if total:
+        print(f"  wide-split: re-flowed {total} long equations into aligned lines")
     return md_text, jobs, cache
+
+
+# Formula-only numbered lines — "(1) $…$;", "(ii) $…$", "3. $…$" — are
+# enumerated DISPLAY equations in print. Left as markdown they become pandoc
+# <ol> items whose <p> may or may not be image-only (where the trailing
+# punctuation landed decides), so weak engines render neighbouring items at
+# unrelated sizes: iReader stretches an image-only li paragraph ~full-width
+# by bitmap aspect but pins an image next to a text node to its px band, and
+# tall members get promoted into full-width displays that split the list
+# (empty <li>). Re-flow each onto its own display line with the marker
+# embedded (\text{(1)}\quad …): every member takes the same canvas sizing,
+# the book's own numbering is kept out of pandoc's renumbering, and the list
+# cannot split. Markers are canonicalised to ASCII "(N)" so \text{} never
+# needs a CJK glyph.
+_MARKER_MATH_LINE_RE = re.compile(
+    r"^\s*(?P<mark>[（(]\s*[0-9a-zA-Z]+\s*[)）]|[0-9a-zA-Z]+[.、．)])\s*"
+    r"⟂MATH[DI]:(?P<key>[0-9a-f]+)⟂\s*(?P<tail>[。．，,；;、：:）)】\].]*)\s*$"
+)
+# OCR sometimes splits an equation number from its formula across lines
+# ("(C)" alone, blank line, then the lone token). The bare marker alone is
+# parsed by pandoc as an EMPTY list item once the formula moves to a
+# display line - merge the pair first so the marker+formula re-flow
+# below consumes it as one unit.
+_BARE_MARKER_RE = re.compile(
+    r"^\s*(?P<mark>[（(]\s*[0-9a-zA-Z]+\s*[)）]|[0-9a-zA-Z]+[.、．)])\s*$"
+)
+_LONE_TOKEN_RE = re.compile(
+    r"^\s*⟂MATH[DI]:([0-9a-f]+)⟂\s*(?P<tail>[。．，,；;、：:）)】\].]*)\s*$"
+)
+
+_FW_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+# An inline formula orphaned as its own paragraph (OCR split a sentence's
+# tail onto its own line — "$B = 0.$" after list item "(v) … A = \\infty$")
+# becomes an IMAGE-ONLY <p>: aspect-stretching engines give it the display
+# canvas treatment and blow a 2ex fragment up to ~full width (device report
+# "B = 0 显示太大"). In print it is the tail of the previous line — merge it
+# back there. Only inline tokens (a lone display token is the normal display
+# case) whose previous line carries real text (not heading/table/quote, not
+# another bare token) are merged.
+_LONE_INLINE_LINE_RE = re.compile(r"^\s*⟂MATHI:[0-9a-f]+⟂\s*$")
+
+
+def _merge_orphan_inline_lines(md_text: str) -> tuple[str, int]:
+    """See _LONE_INLINE_LINE_RE. Returns (new md, number of merged lines)."""
+    out: list[str] = []
+    n = 0
+    for line in md_text.split("\n"):
+        if _LONE_INLINE_LINE_RE.match(line):
+            j = len(out) - 1
+            while j >= 0 and not out[j].strip():
+                j -= 1
+            if (
+                j >= 0
+                and not out[j].lstrip().startswith(("#", "|", ">"))
+                and re.search(r"[\u4e00-\u9fffA-Za-z]", out[j])
+            ):
+                out[j] = out[j].rstrip() + " " + line.strip()
+                del out[j + 1:]
+                n += 1
+                continue
+        out.append(line)
+    return "\n".join(out), n
+
+
+
+# Lines that pandoc turns into list/heading/table/quote blocks — an inline
+# formula token on one of them can never be re-flowed onto its own line
+# (that would split the block). Covers the "(1)", "（2）", "a)", "3、" marker
+# forms pandoc accepts as list markers, not just "1."/"-".
+_LIST_LINE_RE = re.compile(
+    r"\s*(?:[-*+•]|\(\d+\)|\([a-zA-Z]\)|（\d+）|(?:\d+|[a-zA-Z]{1,4})[.)、．])\s"
+)
+
+
+def _canonical_marker(mark: str) -> str | None:
+    m = re.fullmatch(
+        r"[（(]\s*([0-9a-zA-Z]+)\s*[)）]|([0-9a-zA-Z]+)[.、．)]", mark
+    )
+    inner = (m.group(1) or m.group(2)).translate(_FW_DIGITS) if m else ""
+    return f"({inner})" if inner.isascii() and inner else None
+
+
+def _reflow_numbered_math_lines(
+    md_text: str, jobs: dict
+) -> tuple[str, dict, list[str]]:
+    """See _MARKER_MATH_LINE_RE. Returns (new md, jobs, new display keys)."""
+    lines = md_text.split("\n")
+    pre: list[str] = []
+    i = 0
+    while i < len(lines):
+        mm = _BARE_MARKER_RE.match(lines[i])
+        if mm:
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and _LONE_TOKEN_RE.match(lines[j]):
+                pre.append(f"{mm['mark']} {lines[j].strip()}")
+                i = j + 1
+                continue
+        pre.append(lines[i])
+        i += 1
+    md_text = "\n".join(pre)
+    out: list[str] = []
+    new_keys: list[str] = []
+    for line in md_text.split("\n"):
+        m = _MARKER_MATH_LINE_RE.match(line)
+        if not m or m["key"] not in jobs or "text_html" in jobs[m["key"]]:
+            out.append(line)
+            continue
+        canon = _canonical_marker(m["mark"])
+        if canon is None:
+            out.append(line)
+            continue
+        latex = jobs[m["key"]]["latex"]
+        new_latex = f"\\text{{{canon}}}\\quad {latex}"
+        new_key = _hash(new_latex)
+        jobs[new_key] = {"latex": new_latex, "display": True}
+        new_keys.append(new_key)
+        out.append("")
+        out.append(f"⟂MATHD:{new_key}⟂{m['tail']}")
+        out.append("")
+    if new_keys:
+        print(
+            f"  numbered display: re-flowed {len(new_keys)} marker+formula "
+            "lines onto their own display line"
+        )
+    return "\n".join(out), jobs, new_keys
 
 
 def render_math_via_node(
@@ -647,7 +982,16 @@ def inject_svg_math(
             # itself calibrates glyph size. NO max-width/height:auto —
             # iReader treats max-width:100% as width:100% (stretch).
             _, w_ex, h_ex = png_meta[key][0]
-            w_box = max(canvas_px / (px_per_ex * RASTER_SCALE), w_ex)
+            canvas_ex = canvas_px / (px_per_ex * RASTER_SCALE)
+            if w_ex > canvas_ex:
+                # Over-wide content the re-flow pass could not split
+                # (multi-row \begin{array} chains etc.): uniformly shrink
+                # the box to the canvas width, aspect preserved. Both dims
+                # pinned on a box wider than the column makes KOReader clamp
+                # the width and keep the height — horizontal squash.
+                h_ex = h_ex * canvas_ex / w_ex
+                w_ex = canvas_ex
+            w_box = max(canvas_ex, w_ex)
             w_attr, h_attr = round(w_box * px_per_ex), round(h_ex * px_per_ex)
             return (
                 f'<img class="math-display-img" src="../media/eq-{key}.png" '
@@ -657,16 +1001,18 @@ def inject_svg_math(
             )
         _, w_ex, h_ex = png_meta[key][0]
         valign = (cache.get(key) or {}).get("valign_ex", 0)
-        v_px = round(valign * px_per_ex)
-        # px height capped into the safe box (ex stays true); complex (tall)
-        # inline formulas get a px boost so inner glyphs stay legible on
-        # px-only engines. No width attribute (device-verified, imgtest5/6):
+        # px fallback banded into a few sizes (see INLINE_PX_BANDS): ex-blind
+        # engines showed proportional px as size jitter between neighbouring
+        # formulas. The bitmap scales by band/h_ex, so the baseline offset
+        # (valign) scales by the same factor or the glyphs would sit off the
+        # text baseline. No width attribute (device-verified, imgtest5/6):
         # engines that must fit an inline image into the remaining line width
         # squeeze the width and keep the height when both attrs are pinned
         # (KOReader), breaking the aspect — with height alone every engine
         # derives width from the bitmap ratio, so the aspect can never break.
-        boost = INLINE_BOOST if h_ex >= INLINE_BOOST_EX else 1.0
-        h_px = round(min(h_ex * px_per_ex * boost, box_h))
+        band_ex = next(b for lim, b in INLINE_PX_BANDS if h_ex < lim)
+        h_px = round(min(band_ex * px_per_ex, box_h))
+        v_px = round(valign * px_per_ex * band_ex / h_ex)
         return (
             f'<img class="math-inline" src="../media/eq-{key}.png" '
             f'height="{h_px}" '
@@ -688,6 +1034,10 @@ def inject_svg_math(
             f.write_text(entry["svg"], encoding="utf-8")
         alt = html.escape(jobs[key]["latex"], quote=True)
         if display:
+            canvas_ex = canvas_px / (px_per_ex * RASTER_SCALE)
+            if w_ex > canvas_ex:  # un-splittable over-wide: aspect-true shrink
+                h_ex = h_ex * canvas_ex / w_ex
+                w_ex = canvas_ex
             w_attr, h_attr = round(w_ex * px_per_ex), round(h_ex * px_per_ex)
             return (
                 f'<img class="math-display-img" src="../media/eq-{key}.svg" '
@@ -792,11 +1142,21 @@ def _probe_ink_aspect(svg: str, png_dir: Path, key: str) -> float:
 
 
 # Raster strategy (device-validated): 2x supersampling is sharp on e-ink ppi
-# (test1 row D); 32-colour palette PNG compresses line art to ~1/4 of
-# grayscale+alpha with no visible loss — e-ink panels physically show 16 gray
-# levels. Together ~27% of the old 3xLA size.
+# for INLINE bitmaps (test1 row D — they display at their px band); 32-colour
+# palette PNG compresses line art to ~1/4 of grayscale+alpha with no visible
+# loss — e-ink panels physically show 16 gray levels.
 RASTER_SCALE = 2
 RASTER_COLORS = 32
+# DISPLAY bitmaps are a different story: the canvas scheme stretches them to
+# ~full screen width on aspect-sizing engines (iReader) and to the ex box on
+# full-CSS engines — a 720-px canvas across a 1404-1872 device-px panel
+# upsamples ~2x and looks blurry (device report "行间公式模糊"). Display
+# formulas rasterise at double density instead: the canvas bitmap doubles to
+# canvas_px*(DISPLAY_RASTER_SCALE/RASTER_SCALE) px, the CSS geometry is
+# untouched (canvas_ex is density-invariant — see inject_svg_math), so the
+# iReader glyph calibration and every markup size stay exactly as calibrated.
+DISPLAY_RASTER_SCALE = 4
+DISPLAY_RASTER_CAP = 3200  # px cap for display content (1600 for inline)
 
 
 def render_pngs(
@@ -818,6 +1178,7 @@ def render_pngs(
     from PIL import Image
 
     png_dir.mkdir(parents=True, exist_ok=True)
+    disp = display_keys or set()
     meta: dict[str, list[tuple[str, float, float]]] = {}
     jobs: list[tuple[Path, Path, int]] = []
 
@@ -849,8 +1210,12 @@ def render_pngs(
             continue
         svg_file = png_dir / f"eq-{key}.svg"
         svg_file.write_text(entry["svg"], encoding="utf-8")
+        scale, cap = (
+            (DISPLAY_RASTER_SCALE, DISPLAY_RASTER_CAP) if key in disp
+            else (RASTER_SCALE, 1600)
+        )
         jobs.append(
-            (svg_file, out, max(min(round(w_ex * 8 * RASTER_SCALE), 1600), 8))
+            (svg_file, out, max(min(round(w_ex * 8 * scale), cap), 8))
         )
 
     def _rsvg(job: tuple[Path, Path, int]) -> None:
@@ -893,6 +1258,9 @@ def render_pngs(
     # back out first, so changing the canvas re-pads correctly in BOTH
     # directions. meta keeps the CONTENT ex-dims — the display markup
     # derives the canvas box from them (see _img).
+    # The config knob is calibrated in RASTER_SCALE-density px; the physical
+    # canvas bitmap runs at DISPLAY_RASTER_SCALE density (same ex geometry).
+    canvas_w = round(canvas_px * DISPLAY_RASTER_SCALE / RASTER_SCALE)
     n_pad = 0
     for key in display_keys or ():
         if key not in meta:
@@ -901,22 +1269,28 @@ def render_pngs(
         out = png_dir / f"eq-{key}.png"
         with Image.open(out) as im:
             w, h = im.size
-            w_content = max(min(round(w_ex * 8 * RASTER_SCALE), 1600), 8)
+            w_content = max(
+                min(round(w_ex * 8 * DISPLAY_RASTER_SCALE), DISPLAY_RASTER_CAP), 8
+            )
             if w > w_content:  # strip previous canvas padding (centred)
                 x0 = (w - w_content) // 2
                 im = im.crop((x0, 0, x0 + w_content, h))
                 w = w_content
-            if w >= canvas_px:
+            if w >= canvas_w:
                 continue  # wide content: canvas would add nothing
             rgba = im.convert("RGBA")
-        canvas = Image.new("RGBA", (canvas_px, h), (0, 0, 0, 0))
-        canvas.paste(rgba, ((canvas_px - w) // 2, 0), rgba)
+        canvas = Image.new("RGBA", (canvas_w, h), (0, 0, 0, 0))
+        canvas.paste(rgba, ((canvas_w - w) // 2, 0), rgba)
         canvas.quantize(colors=RASTER_COLORS, method=2).save(
             out, optimize=True
         )
         n_pad += 1
     if n_pad:
-        print(f"  display canvas: centred {n_pad} bitmaps on {canvas_px}px")
+        print(
+            f"  display canvas: centred {n_pad} bitmaps on {canvas_w}px "
+            f"@ {DISPLAY_RASTER_SCALE // RASTER_SCALE}x density "
+            f"(calibration {canvas_px}px)"
+        )
     return meta
 
 
@@ -1589,10 +1963,32 @@ def main(argv: list[str] | None = None) -> int:
                 raise ConvertError("'$' remains after tokenisation — untokenised math?")
             md_text = tokenised
             if mode == "png":
+                # Inline tokens living on lines that must never be re-flowed
+                # (headings/tables/quotes/list items) cannot take the
+                # promoted display path; flipping them to display glyphs
+                # only shrinks them inside the clamped text line.
+                blocked = {
+                    k
+                    for line in md_text.split("\n")
+                    if line.startswith(("#", "|", ">")) or _LIST_LINE_RE.match(line)
+                    for k in re.findall(r"⟂MATHI:([0-9a-f]+)⟂", line)
+                }
                 # Content-aware rendering style: simple display formulas get
                 # compact inline glyphs, complex inline ones get full display
                 # glyphs (see FLIP_* constants).
-                flips = _decide_flips(cache, jobs)
+                flips = _decide_flips(
+                    cache, {k: v for k, v in jobs.items() if k not in blocked}
+                )
+                # Stale display renders of now-blocked tokens (flip decided
+                # by an earlier build) revert to inline glyphs.
+                for k in blocked:
+                    if (
+                        k in jobs
+                        and "text_html" not in jobs[k]
+                        and not jobs[k]["display"]
+                        and (cache.get(k) or {}).get("rendered_display", False)
+                    ):
+                        flips[k] = False
                 if flips:
                     n_to_inline = sum(1 for v in flips.values() if not v)
                     print(
@@ -1613,34 +2009,56 @@ def main(argv: list[str] | None = None) -> int:
                         (build_dir / "png_cache" / f"eq-{k}.png").unlink(
                             missing_ok=True
                         )
-                # Over-wide display equations: re-flow into aligned lines so
-                # each line fits the box width and glyphs render near text
-                # size instead of width-capped small.
-                md_text, jobs, cache = _split_wide_formulas(
-                    md_text, jobs, cache, build_dir
+                md_text, n_merged = _merge_orphan_inline_lines(md_text)
+                if n_merged:
+                    print(
+                        f"  orphan inline: merged {n_merged} formula-only "
+                        "lines back into their paragraph"
+                    )
+                # Enumerated display equations ("(1) $…$;" lines) re-flow as
+                # a whole onto display lines — see _reflow_numbered_math_lines.
+                md_text, jobs, new_keys = _reflow_numbered_math_lines(
+                    md_text, jobs
                 )
-                svg_cache, svg_jobs = cache, jobs
+                if new_keys:
+                    cache, _ = render_math_via_node(
+                        {k: jobs[k] for k in new_keys},
+                        build_dir,
+                        build_dir / "math_cache.json",
+                    )
+                    svg_cache, svg_jobs = cache, jobs
                 # Tall inline formulas are clamped to one text line on weak
                 # engines whatever the markup (imgtest5/6): re-flow them
                 # onto their own display line — standard math typesetting
-                # for tall formulas. Dims come from the rendered SVG.
-                def _h_ex(k: str) -> float | None:
+                # for tall formulas. Over-wide ones (wider than a full text
+                # line) are squeezed horizontally by every wrapping engine,
+                # so they take the same path. Dims come from the rendered SVG.
+                def _dims_ex(k: str) -> tuple[float, float] | None:
                     svg = (cache.get(k) or {}).get("svg")
                     dims = _svg_ex_dims(svg) if svg else None
-                    return dims[1] if dims else None
+                    return dims if dims else None
 
                 promote = {
                     k for k, j in jobs.items()
                     if not j["display"] and "text_html" not in j
-                    and (h := _h_ex(k)) is not None and h >= PROMOTE_INLINE_EX
+                    and f"⟂MATHI:{k}⟂" in md_text
+                    and (d := _dims_ex(k)) is not None
+                    and (d[1] >= PROMOTE_INLINE_EX or d[0] >= PROMOTE_INLINE_W_EX)
                 }
                 # A promoted key's bitmap gets canvas padding (display
                 # treatment), which would wreck any occurrence that must
                 # stay inline — keep such keys fully inline instead.
+                # _LIST_LINE_RE (not just "1."/"-"): promoting a formula on
+                # a "(2)"-style marker line splits the list item — the
+                # marker stays as an empty <li> and the line's text is
+                # scattered (vol-3 Dini/Abel round). The height-pinned
+                # inline markup keeps its aspect on every engine, so the
+                # print layout (numbered condition line with inline math)
+                # survives.
                 blocked = set()
                 for line in md_text.split("\n"):
-                    if line.startswith(("#", "|", ">")) or re.match(
-                        r"\s*([-*+]|\d+\.)\s", line
+                    if line.startswith(("#", "|", ">")) or _LIST_LINE_RE.match(
+                        line
                     ):
                         blocked.update(
                             k for k in promote if f"⟂MATHI:{k}⟂" in line
@@ -1665,9 +2083,18 @@ def main(argv: list[str] | None = None) -> int:
                     for k in promote:
                         jobs[k]["display"] = True
                     print(
-                        f"  promoted {state['n']} tall inline formulas "
-                        f"(>= {PROMOTE_INLINE_EX}ex) onto their own line"
+                        f"  promoted {state['n']} tall/wide inline formulas "
+                        f"(h >= {PROMOTE_INLINE_EX}ex or "
+                        f"w >= {PROMOTE_INLINE_W_EX}ex) onto their own line"
                     )
+                # Over-wide display equations (promoted ones included — they are
+                # display jobs by the time this runs): re-flow into aligned lines so
+                # each line fits the box width and glyphs render near text
+                # size instead of width-capped small.
+                md_text, jobs, cache = _split_wide_formulas(
+                    md_text, jobs, cache, build_dir
+                )
+                svg_cache, svg_jobs = cache, jobs
                 png_meta = render_pngs(
                     cache,
                     build_dir / "png_cache",
