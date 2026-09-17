@@ -44,3 +44,4 @@ package-lock.json
 rag_architecture.png
 test_assets/
 tests/
+.gstack/
