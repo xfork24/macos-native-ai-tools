@@ -356,14 +356,21 @@ FLIP_DISPLAY_MAX_H_EX = 2.5
 FLIP_DISPLAY_MAX_W_EX = 25.0
 FLIP_INLINE_MIN_H_EX = 3.0
 
-# Display formulas wider than this (ex) carry width ONLY — no height attr, no
-# height CSS. Engines that shrink an oversized image to the text column keep
-# any pinned height and squash it flat (device-verified: ~57ex formulas came
-# out 压扁 on iReader with height pinned both via attr and px CSS). With width
-# alone, every engine derives height from the bitmap's intrinsic ratio, so the
-# aspect survives any shrink; on full-CSS engines the ex width still scales
-# with font size and the ratio-scaled height follows.
-WIDE_WIDTH_ONLY_EX = 40.0
+# png-mode display sizing, decided across imgtest4/5/6 device rounds:
+#   - iReader clamps formula images TALLER than ~44 css px to a single text
+#     line, no matter the markup (pinned/width-only/block-class/figure
+#     replica/wrapper/line-height all failed); 43 px is verified safe.
+#     It also squashes over-wide images (width shrunk, height kept).
+#   - KOReader and full-CSS engines render every variant fine.
+# So the px fallback values (native attrs + px CSS) are scaled to fit a
+# conservative box, while the ex declarations stay true — weak engines never
+# trip their clamps, good engines keep exact font-relative sizing. Tall
+# formulas are additionally split into per-line strips at transparent bands
+# (each strip under the clamp), which lets multi-line math render near full
+# size on weak engines instead of being capped small.
+FALLBACK_BOX_PX = (380, 44)
+SPLIT_ABOVE_EX = 5.4  # tallest device-verified-safe display image (~43 px)
+STRIP_MIN_EX = 1.5  # don't shatter bitmaps into tiny slivers
 
 
 def _decide_flips(cache: dict, jobs: dict) -> dict[str, bool]:
@@ -455,36 +462,40 @@ def inject_svg_math(
     def _img(key: str, display: bool) -> str | None:
         if png_meta is None or key not in png_meta:
             return None
-        w_ex, h_ex = png_meta[key]
         alt = html.escape(jobs[key]["latex"], quote=True)
-        src = f"../media/eq-{key}.png"
-        # Dual-unit cascade, px first / ex second. Full-CSS engines keep
-        # font-size scaling (ex wins the cascade); ex-blind engines (iReader,
-        # Kindle) drop the ex declaration and fall back to the px value — the
-        # same numbers the native width/height attributes carry, so every
-        # fallback path renders the same size, and vertical-align finally
-        # has a real value on engines that ignore ex.
-        w_px, h_px = round(w_ex * px_per_ex), round(h_ex * px_per_ex)
+        box_w, box_h = FALLBACK_BOX_PX
         if display:
-            if w_ex > WIDE_WIDTH_ONLY_EX:
-                return (
-                    f'<img src="{src}" width="{w_px}" '
-                    f'style="width:{w_px}px;width:{w_ex}ex" alt="{alt}"/>'
+            # png_meta[key] = [(suffix, w_ex, h_ex), …] — one entry per
+            # strip for split multi-line formulas (all strips share the
+            # formula width so aligned columns line up).
+            parts = png_meta[key]
+            # Formula-level width scale (uniform across strips); per-strip
+            # height scale on top. ex declarations stay true throughout.
+            w_scale = min(1.0, box_w / (parts[0][1] * px_per_ex))
+            imgs = []
+            for suffix, w_ex, h_ex in parts:
+                s = min(w_scale, box_h / (h_ex * px_per_ex))
+                w_px, h_px = round(w_ex * px_per_ex * s), round(h_ex * px_per_ex * s)
+                imgs.append(
+                    f'<img src="../media/eq-{key}{suffix}.png" '
+                    f'width="{w_px}" height="{h_px}" '
+                    f'style="width:{w_px}px;width:{w_ex}ex;'
+                    f'height:{h_px}px;height:{h_ex}ex" alt="{alt}"/>'
                 )
-            # Width AND height in dual units so scaling engines grow both by
-            # the same factor (aspect preserved). Never height:auto — it is a
-            # valid keyword even on ex-blind engines and would restore the
-            # intrinsic 2x bitmap size.
-            return (
-                f'<img src="{src}" width="{w_px}" height="{h_px}" '
-                f'style="width:{w_px}px;width:{w_ex}ex;'
-                f'height:{h_px}px;height:{h_ex}ex" alt="{alt}"/>'
-            )
+            return "\n".join(imgs)
+        _, w_ex, h_ex = png_meta[key][0]
         valign = (cache.get(key) or {}).get("valign_ex", 0)
         v_px = round(valign * px_per_ex)
+        # px height capped into the safe box (ex stays true); no width
+        # attribute (device-verified, imgtest5/6): engines that must fit an
+        # inline image into the remaining line width squeeze the width and
+        # keep the height when both attrs are pinned (KOReader), breaking
+        # the aspect — with height alone every engine derives width from
+        # the bitmap ratio, so the aspect can never break.
+        h_px = round(min(h_ex * px_per_ex, box_h))
         return (
-            f'<img class="math-inline" src="{src}" '
-            f'width="{w_px}" height="{h_px}" '
+            f'<img class="math-inline" src="../media/eq-{key}.png" '
+            f'height="{h_px}" '
             f'style="height:{h_px}px;height:{h_ex}ex;'
             f'vertical-align:{v_px}px;vertical-align:{valign}ex" alt="{alt}"/>'
         )
@@ -563,17 +574,60 @@ RASTER_SCALE = 2
 RASTER_COLORS = 32
 
 
-def render_pngs(cache: dict, png_dir: Path) -> dict[str, tuple[float, float]]:
+def _strip_bands(png: Path, min_px: int) -> list[tuple[int, int]]:
+    """Split a formula bitmap into (y0, y1) spans at fully transparent rows.
+
+    A cut only happens on an interior blank band (MathJax leaves one between
+    array/aligned rows); constructs whose ink spans every row — a tall
+    ``\\left\\{`` brace, a fraction bar — come back unsplit.
+    """
+    from PIL import Image
+
+    with Image.open(png) as im:
+        alpha = im.convert("RGBA").getchannel("A")
+    w, h = alpha.size
+    inked = alpha.point(lambda a: 255 if a > 16 else 0)
+    empty = [inked.crop((0, y, w, y + 1)).getbbox() is None for y in range(h)]
+    cuts, y = [], 0
+    while y < h:
+        if not empty[y]:
+            y += 1
+            continue
+        y0 = y
+        while y < h and empty[y]:
+            y += 1
+        # interior bands only (not the padding around the ink), >= 2 px tall
+        if y0 > 2 and y < h - 2 and y - y0 >= 2:
+            cuts.append((y0 + y) // 2)
+    chosen, start = [], 0
+    for c in cuts:  # earliest cut that keeps every strip >= min_px
+        if c - start >= min_px:
+            chosen.append(c)
+            start = c
+    if chosen and h - chosen[-1] < min_px:  # don't leave a tiny tail strip
+        chosen.pop()
+    spans, start = [], 0
+    for c in chosen:
+        spans.append((start, c))
+        start = c
+    spans.append((start, h))
+    return spans
+
+
+def render_pngs(cache: dict, png_dir: Path) -> dict[str, list[tuple[str, float, float]]]:
     """Rasterise every cached SVG formula to PNG (2x, capped 1600px wide).
 
-    Returns {key: (width_ex, height_ex)} parsed from the SVG root — the caller
-    needs the ex-dimensions to size the <img> in CSS units so formulas scale
-    with the reader's font size.
+    Returns {key: [(png_suffix, width_ex, height_ex), …]} — one entry for a
+    normal formula, one per line-strip for tall multi-line formulas (all
+    strips share the formula width so aligned columns line up when stacked).
+    The caller needs the ex-dimensions to size the <img> in CSS units so
+    formulas scale with the reader's font size.
     """
     from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
 
     png_dir.mkdir(parents=True, exist_ok=True)
-    meta: dict[str, tuple[float, float]] = {}
+    meta: dict[str, list[tuple[str, float, float]]] = {}
     jobs: list[tuple[Path, Path, int]] = []
 
     for key, entry in cache.items():
@@ -598,7 +652,7 @@ def render_pngs(cache: dict, png_dir: Path) -> dict[str, tuple[float, float]]:
                 w_ex = h_ex * float(vb.group(3)) / float(vb.group(4))
             else:
                 w_ex = h_ex * _probe_ink_aspect(entry["svg"], png_dir, key)
-        meta[key] = (w_ex, h_ex)
+        meta[key] = [("", w_ex, h_ex)]
         out = png_dir / f"eq-{key}.png"
         if out.exists() and _png_ok(out):
             continue
@@ -625,8 +679,6 @@ def render_pngs(cache: dict, png_dir: Path) -> dict[str, tuple[float, float]]:
 
     # Palette quantisation (RGBA→P32): line-art glyphs compress ~4x smaller
     # than grayscale+alpha with no visible loss on 16-level e-ink panels.
-    from PIL import Image
-
     for _, out, _ in jobs:
         try:
             with Image.open(out) as im:
@@ -635,6 +687,36 @@ def render_pngs(cache: dict, png_dir: Path) -> dict[str, tuple[float, float]]:
                 ).save(out, optimize=True)
         except OSError as exc:
             print(f"  warning: png optimise failed for {out.name}: {exc}")
+
+    # Split tall display formulas into per-line strips at transparent bands:
+    # each strip stays under the weak-engine image clamp (FALLBACK_BOX_PX),
+    # so multi-line math renders near full size instead of one squashed
+    # line. Full-width slices keep the horizontal alignment of stacked rows.
+    n_split = 0
+    for key, parts in meta.items():
+        h_ex = parts[0][2]
+        if h_ex <= SPLIT_ABOVE_EX:
+            continue
+        full = png_dir / f"eq-{key}.png"
+        spans = _strip_bands(full, round(STRIP_MIN_EX * 8 * RASTER_SCALE))
+        if len(spans) < 2:
+            continue  # unsplittable (spanning brace / fraction bar): px-cap
+        with Image.open(full) as im:
+            bitmap_h = im.height
+            rgba = im.convert("RGBA")
+        strips = []
+        for i, (y0, y1) in enumerate(spans, 1):
+            suffix = f"-p{i}"
+            spath = png_dir / f"eq-{key}{suffix}.png"
+            if not (spath.exists() and _png_ok(spath)):
+                rgba.crop((0, y0, rgba.width, y1)).quantize(
+                    colors=RASTER_COLORS, method=2
+                ).save(spath, optimize=True)
+            strips.append((suffix, parts[0][1], round(h_ex * (y1 - y0) / bitmap_h, 3)))
+        meta[key] = strips
+        n_split += 1
+    if n_split:
+        print(f"  split {n_split} tall formulas into line strips")
     return meta
 
 
@@ -895,7 +977,7 @@ def build_epub_chunked(
         xhtml = inject_svg_math(xhtml, cache, jobs, png_meta, px_per_ex)
         if png_meta is not None and png_dir is not None:
             for name in set(
-                re.findall(r'src="\.\./media/(eq-[0-9a-f]+\.png)"', xhtml)
+                re.findall(r'src="\.\./media/(eq-[^"/]+\.png)"', xhtml)
             ):
                 staged = staging / "EPUB" / "media" / name
                 if not staged.exists():
