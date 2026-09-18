@@ -1,217 +1,196 @@
 #!/usr/bin/env python3
-"""Structural + math-coverage validator for the generated EPUBs.
-
-Usage:
-    python3 validate.py <book.epub> [--expect-top N] [--expect-leaves N]
-
-Exits non-zero when any check fails; prints a PASS/FAIL line per check.
-"""
-
+"""EPUB 结构与内容覆盖检查。支持独立 CLI 和无全局状态的 Python API。"""
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import hashlib
+import json
 import posixpath
 import re
-import subprocess
 import sys
-import zipfile
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
-from pathlib import PurePosixPath
-
-MATHML_NS = "{http://www.w3.org/1998/Math/MathML}"
-XHTML_NS = "{http://www.w3.org/1999/xhtml}"
-EPUB_NS = "{http://www.idpf.org/2007/ops}"
-MIMETYPE = "application/epub+zip"
-RESIDUAL_MATH_RE = re.compile(r"\$\$|\$[^$\n]{1,120}\$")
-# <annotation> re-encodes the original TeX inside MathML — its dollars are
-# data, not stray delimiters.
-MATHML_ANNOTATION_RE = re.compile(r"<annotation[^>]*>.*?</annotation>", re.S)
-# pandoc's fallback for unconvertible TeX: <span class="math …">$…$</span>
-MATH_FALLBACK_RE = re.compile(
-    r'<span class="math[^"]*">.*?</span>', re.S
-)
-
-results: list[tuple[str, bool, str]] = []
+import zipfile
 
 
-def record(name: str, ok: bool, detail: str = "") -> None:
-    results.append((name, ok, detail))
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
+def digest_code(text):
+    return hashlib.sha256(text.rstrip('\n').encode()).hexdigest()
 
 
-def xmllint_ok(data: bytes, name: str) -> bool:
-    proc = subprocess.run(
-        ["xmllint", "--noout", "-"], input=data, capture_output=True
-    )
-    if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-        record(f"xml well-formed: {name}", False, err[0] if err else "")
-        return False
-    return True
-
-
-def strip_tags(xhtml: str) -> str:
-    return re.sub(r"<[^>]+>", " ", xhtml)
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("epub", type=__import__("pathlib").Path)
-    parser.add_argument("--expect-top", type=int, default=11)
-    parser.add_argument("--expect-leaves", type=int, default=43)
-    parser.add_argument("--min-math", type=int, default=8000)
-    args = parser.parse_args(argv)
-
-    with zipfile.ZipFile(args.epub) as zf:
-        names = set(zf.namelist())
-        infos = zf.infolist()
-
-        # 1. mimetype: first entry, stored uncompressed, exact content.
-        ok = (
-            infos[0].filename == "mimetype"
-            and infos[0].compress_type == zipfile.ZIP_STORED
-            and zf.read("mimetype") == MIMETYPE.encode()
-        )
-        record("mimetype (first, stored, exact)", ok)
-
-        # 2. required parts parse.
-        container = zf.read("META-INF/container.xml")
-        ok = xmllint_ok(container, "container.xml")
-        rootfile = ET.fromstring(container).find(
-            ".//{*}rootfile[@full-path]"
-        )
-        opf_path = rootfile.get("full-path") if rootfile is not None else None
-        ok = ok and opf_path in names and xmllint_ok(
-            zf.read(opf_path), opf_path
-        )
-        record("container.xml + OPF present & parse", ok)
-        if not opf_path or opf_path not in names:
-            return 1
-        opf_dir = str(PurePosixPath(opf_path).parent)
-
-        opf = ET.fromstring(zf.read(opf_path))
-        manifest = {
-            item.get("id"): item.get("href")
-            for item in opf.findall(".//{*}manifest/{*}item")
-        }
-        spine_ids = {
-            itemref.get("idref")
-            for itemref in opf.findall(".//{*}spine/{*}itemref")
-        }
-
-        # 3. every manifest href exists in the zip.
-        missing = [
-            href
-            for href in manifest.values()
-            if f"{opf_dir}/{href}" not in names
-        ]
-        record(
-            "manifest hrefs resolve",
-            not missing,
-            f"{len(missing)} missing" if missing else f"{len(manifest)} items",
-        )
-
-        # 4. nav + ncx present.
-        nav_path = next(
-            (h for h in manifest.values() if h.endswith("nav.xhtml")), None
-        )
-        ncx_ok = any(h.endswith(".ncx") for h in manifest.values())
-        record("nav.xhtml + toc.ncx in manifest", bool(nav_path) and ncx_ok)
-
-        # 5. XHTML well-formedness (xmllint) + collect content stats.
-        xhtml_paths = sorted(n for n in names if n.endswith(".xhtml"))
-        wellformed, mathml_count, svg_count, png_count = 0, 0, 0, 0
-        residual, fallback_spans, img_misses = 0, 0, []
-        for name in xhtml_paths:
-            data = zf.read(name)
-            if not xmllint_ok(data, name):
-                continue
-            wellformed += 1
-            text = data.decode("utf-8", "replace")
-            mathml_count += text.count("<math ")
-            svg_count += text.count("<svg")
-            png_count += text.count('src="../media/eq-')
-            # trivial single-token formulas render as HTML text, not bitmaps
-            png_count += text.count('class="msym"')
-            # pandoc's raw-TeX fallback spans are counted separately; only
-            # delimiters outside them mean a formula was silently lost.
-            fallback_spans += len(MATH_FALLBACK_RE.findall(text))
-            stripped = MATH_FALLBACK_RE.sub(" ", MATHML_ANNOTATION_RE.sub(" ", text))
-            if RESIDUAL_MATH_RE.search(strip_tags(stripped)):
-                residual += 1
-            base = str(PurePosixPath(name).parent)
-            for src in re.findall(r'(?:src|xlink:href)="([^"]+)"', text):
-                if not re.search(r"\.(jpe?g|png|gif|svg)$", src, re.I):
+def validate_epub(path: Path, expected: dict | None = None, mode: str | None = None):
+    expected = expected or {}
+    checks, warnings = [], []
+    stats = {'math': 0, 'fallback': 0, 'code_hashes': [], 'tables': 0, 'mode': mode}
+    def record(name, ok, detail=''):
+        checks.append({'name': name, 'ok': bool(ok), 'detail': detail})
+    def local(tag):
+        return tag.rsplit('}', 1)[-1]
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist()); infos = z.infolist()
+            record('mimetype', bool(infos) and infos[0].filename == 'mimetype' and infos[0].compress_type == zipfile.ZIP_STORED and z.read('mimetype') == b'application/epub+zip')
+            record('unique ZIP entries', len(names) == len(infos))
+            container = ET.fromstring(z.read('META-INF/container.xml'))
+            opf_path = container.find('.//{*}rootfile').get('full-path')
+            opf = ET.fromstring(z.read(opf_path)); base = posixpath.dirname(opf_path)
+            manifest = {x.get('id'): x for x in opf.findall('.//{*}manifest/{*}item')}
+            if 'contributors' in expected:
+                by_id = {
+                    x.get('id'): ''.join(x.itertext())
+                    for x in opf.findall('.//{*}contributor')
+                    if x.get('id')
+                }
+                actual = {'trl': [], 'rev': []}
+                for role in opf.findall('.//{*}meta[@property="role"]'):
+                    key = (role.get('refines') or '').removeprefix('#')
+                    value = ''.join(role.itertext()).strip()
+                    if value in actual and key in by_id:
+                        actual[value].append(by_id[key])
+                record(
+                    'contributor roles',
+                    all(
+                        Counter(actual.get(role, [])) == Counter(names)
+                        for role, names in expected['contributors'].items()
+                    ),
+                    str(actual),
+                )
+            def resolve(origin, href):
+                return posixpath.normpath(posixpath.join(posixpath.dirname(origin), unquote(urlsplit(href).path)))
+            record('manifest resources', all(resolve(opf_path, x.get('href','')) in names for x in manifest.values()))
+            spine = [x.get('idref') for x in opf.findall('.//{*}spine/{*}itemref')]
+            record('spine references', bool(spine) and all(x in manifest for x in spine))
+            spine_paths = {resolve(opf_path, manifest[x].get('href')) for x in spine if x in manifest}
+            trees = {}
+            for name in sorted(names):
+                if name.endswith(('.xhtml', '.svg', '.ncx')):
+                    try:
+                        trees[name] = ET.fromstring(z.read(name))
+                    except ET.ParseError as exc:
+                        record('XML well-formed: '+name, False, str(exc))
+            record('XHTML well-formed', all(n in trees for n in names if n.endswith('.xhtml')))
+            navitem = next((x for x in manifest.values() if 'nav' in x.get('properties','').split()), None)
+            navpath = resolve(opf_path, navitem.get('href')) if navitem is not None else None
+            ncxitem = next((x for x in manifest.values() if x.get('media-type') == 'application/x-dtbncx+xml'), None)
+            record('nav and NCX present', navpath in trees and ncxitem is not None)
+            missing, bad_anchors, empty_src = [], [], []
+            for name, tree in trees.items():
+                if not name.endswith('.xhtml'):
                     continue
-                target = posixpath.normpath(f"{base}/{src}")
-                if target not in names and target.lstrip("/") not in names:
-                    img_misses.append(f"{name}: {src}")
-        record(
-            "all XHTML well-formed",
-            wellformed == len(xhtml_paths),
-            f"{wellformed}/{len(xhtml_paths)}",
-        )
-        record(
-            "image refs resolve",
-            not img_misses,
-            "; ".join(img_misses[:3]) if img_misses else "all",
-        )
+                for e in tree.iter():
+                    for attr in ('src', 'href', '{http://www.w3.org/1999/xlink}href'):
+                        if attr not in e.attrib:
+                            continue
+                        href = e.get(attr); parts = urlsplit(href)
+                        if not href:
+                            if attr == 'src': empty_src.append(name)
+                            continue
+                        if parts.scheme or parts.netloc:
+                            if attr == 'src': missing.append(name+': external resource '+href)
+                            continue
+                        target = resolve(name, href) if parts.path else name
+                        if target not in names:
+                            missing.append(name+': '+href)
+                        elif parts.fragment and target in trees and not any(x.get('id') == unquote(parts.fragment) for x in trees[target].iter()):
+                            bad_anchors.append(name+': '+href)
+                if name not in spine_paths:
+                    continue
+                body = tree.find('.//{*}body')
+                if body is None:
+                    continue
+                for e in body.iter():
+                    tag, classes = local(e.tag), e.get('class','').split()
+                    if tag == 'math': stats['math'] += 1
+                    if tag == 'img' and '/eq-' in e.get('src',''): stats['math'] += 1
+                    if 'msym' in classes: stats['math'] += 1
+                    if 'math-raw' in classes or (tag == 'span' and 'math' in classes and e.find('.//{*}math') is None): stats['fallback'] += 1
+                    if tag == 'pre': stats['code_hashes'].append(digest_code(''.join(e.itertext())))
+                    if tag == 'table': stats['tables'] += 1
+                record('no unresolved placeholders: '+name, not re.search(r'⟂MATH[DI]:[0-9a-f]+⟂|MD2EPUBCODE\d+END', ''.join(body.itertext())))
+                if mode in ('svg','png'):
+                    record('external formula media: '+name, not any(local(e.tag) == 'svg' for e in body.iter()))
+                    bad_format = [e.get('src') for e in body.iter() if local(e.tag)=='img' and '/eq-' in e.get('src','') and not e.get('src').endswith('.'+mode)]
+                    record('formula media format: '+name, not bad_format)
+            record('resource references', not missing and not empty_src, (missing+empty_src)[:10])
+            record('link anchors', not bad_anchors, bad_anchors[:10])
+            html_manifest = {resolve(opf_path,x.get('href')) for x in manifest.values() if x.get('media-type')=='application/xhtml+xml'}
+            record('spine completeness', not (html_manifest-spine_paths-{navpath}))
+            if navpath in trees:
+                nav = trees[navpath].find('.//{*}nav[@{http://www.idpf.org/2007/ops}type="toc"]')
+                if nav is not None:
+                    top = nav.find('./{*}ol')
+                    stats['nav_top_level'] = len(top.findall('./{*}li')) if top is not None else 0
+                    stats['nav_leaves'] = len(nav.findall('.//{*}li'))
+                    nav_links = [e.get('href') for e in nav.findall('.//{*}a')]
+                    if ncxitem is not None:
+                        ncx = trees.get(resolve(opf_path,ncxitem.get('href')))
+                        if ncx is not None:
+                            ncx_path = resolve(opf_path, ncxitem.get('href'))
 
-        # 6. math coverage (mode auto-detected from dominant math markup).
-        mode, count = max(
-            (("mathml", mathml_count), ("svg", svg_count), ("png", png_count)),
-            key=lambda pair: pair[1],
-        )
-        record(
-            f"math coverage ({mode})",
-            count >= args.min_math,
-            f"{count} elements (min {args.min_math})",
-        )
-        record(
-            "no residual TeX delimiters",
-            residual == 0,
-            f"{residual} files ({fallback_spans} known fallback spans excluded)",
-        )
+                            def canonical_links(origin, links):
+                                return [
+                                    (
+                                        resolve(origin, href),
+                                        unquote(urlsplit(href).fragment),
+                                    )
+                                    for href in links
+                                ]
 
-        # 7. spine completeness (nav.xhtml itself is excepted per spec).
-        unspined = [
-            mid
-            for mid, href in manifest.items()
-            if href.endswith(".xhtml")
-            and href != nav_path
-            and mid not in spine_ids
-        ]
-        record("spine completeness", not unspined, f"{len(unspined)} unspined")
-
-        # 8. nav TOC shape.
-        nav_xhtml = zf.read(f"{opf_dir}/{nav_path}").decode("utf-8")
-        toc = ET.fromstring(nav_xhtml)
-        toc_navs = toc.findall(f".//{XHTML_NS}nav[@{EPUB_NS}type='toc']")
-        toc_nav = toc_navs[0] if toc_navs else None
-        top_ol = toc_nav.find(f"./{XHTML_NS}ol") if toc_nav is not None else None
-        top_li = len(top_ol.findall(f"./{XHTML_NS}li")) if top_ol is not None else 0
-        all_li = len(toc_nav.findall(f".//{XHTML_NS}li")) if toc_nav is not None else 0
-        record(
-            "nav top-level entries",
-            top_li == args.expect_top,
-            f"{top_li} (expected {args.expect_top})",
-        )
-        record(
-            "nav total entries",
-            all_li == args.expect_leaves,
-            f"{all_li} (expected {args.expect_leaves})",
-        )
-        nav_hrefs = re.findall(r'href="([^"#]+)', nav_xhtml)
-        broken = [h for h in nav_hrefs if f"{opf_dir}/{h}" not in names]
-        record("nav hrefs resolve", not broken, f"{len(broken)} broken")
-
-    failed = [name for name, ok, _ in results if not ok]
-    print(
-        f"\n{len(results) - len(failed)}/{len(results)} checks passed"
-        + (f"; FAILED: {', '.join(failed)}" if failed else " — all green")
-    )
-    return 1 if failed else 0
+                            nav_targets = canonical_links(navpath, nav_links)
+                            ncx_targets = canonical_links(
+                                ncx_path,
+                                [
+                                    e.get('src')
+                                    for e in ncx.findall('.//{*}content')
+                                ],
+                            )
+                            # Pandoc includes its generated title page in
+                            # NCX but intentionally omits it from the user
+                            # TOC.  Require every nav target in the same NCX
+                            # order while allowing such NCX-only landmarks.
+                            cursor = iter(ncx_targets)
+                            record(
+                                'nav and NCX order',
+                                all(any(item == target for item in cursor)
+                                    for target in nav_targets),
+                            )
+                    for key in ('nav_top_level','nav_leaves'):
+                        if key in expected: record(key, stats[key] == expected[key], f'{stats[key]} / {expected[key]}')
+            if 'math_occurrences' in expected:
+                total = stats['math']+stats['fallback']
+                record('formula occurrence coverage', total == expected['math_occurrences'], f"rendered {stats['math']}, fallback {stats['fallback']}, expected {expected['math_occurrences']}")
+            if 'min_math' in expected:
+                record('minimum rendered formulas', stats['math'] >= expected['min_math'])
+            if 'code_hashes' in expected:
+                record('code content preserved', Counter(stats['code_hashes']) == Counter(expected['code_hashes']), f"{len(stats['code_hashes'])} / {len(expected['code_hashes'])}")
+            if 'tables' in expected:
+                record('table coverage', stats['tables'] == expected['tables'], f"{stats['tables']} / {expected['tables']}")
+            if 'image_hashes' in expected:
+                packaged = {hashlib.sha256(z.read(n)).hexdigest() for n in names if not n.endswith(('.xhtml','.opf','.ncx','.css'))}
+                record('source images preserved', set(expected['image_hashes']) <= packaged)
+            if stats['fallback']:
+                warnings.append(f"{stats['fallback']} 处公式使用原文回退")
+    except (OSError, ValueError, KeyError, AttributeError, ET.ParseError, zipfile.BadZipFile) as exc:
+        record('read EPUB', False, str(exc))
+    return {'ok': all(x['ok'] for x in checks), 'checks': checks, 'warnings': warnings, 'stats': stats}
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('epub', type=Path)
+    p.add_argument('--expect-top', type=int)
+    p.add_argument('--expect-leaves', type=int)
+    p.add_argument('--min-math', type=int)
+    p.add_argument('--json', type=Path)
+    a=p.parse_args(argv)
+    expected={k:v for k,v in {'nav_top_level':a.expect_top,'nav_leaves':a.expect_leaves,'min_math':a.min_math}.items() if v is not None}
+    result=validate_epub(a.epub, expected)
+    for check in result['checks']:
+        if not check['ok']: print('❌',check['name'],check['detail'])
+    print(f"{'✅' if result['ok'] else '❌'} {sum(c['ok'] for c in result['checks'])}/{len(result['checks'])} checks; {result['stats']['math']} rendered formulas, {result['stats']['fallback']} fallbacks")
+    if a.json: a.json.write_text(json.dumps(result,ensure_ascii=False,indent=2))
+    return 0 if result['ok'] else 1
+
+if __name__=='__main__':
     sys.exit(main())

@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "md_glob": "*.md",
+  "origin_pdf_glob": "*_origin.pdf",
+  "colophon_enabled": true,
+  "colophon_md": "# 关于本电子书\n\n本书由 MinerU OCR 输出自动转换生成。文字、代码与公式可能存在识别错误；转换疑点见构建报告，仅供个人学习使用。\n",
+  "front_matter": "preserve",
+  "toc_depth": 2,
+  "png_px_per_ex": 8.0,
+  "png_display_canvas_px": 720,
+  "text_replacements": [],
+  "expected": {}
+}

@@ -4,36 +4,256 @@
 公式支持 **MathML / SVG / PNG** 三种可切换的渲染方案（兼容性金字塔），
 覆盖广泛的阅读器软硬件。
 
-## 用法
+## 使用 `md2epub.py`
+
+`md2epub.py` 是推荐的统一入口。它读取 MinerU 输出，自动生成书籍配置和章节
+结构，然后生成 MathML、外链 SVG、PNG 三版 EPUB，并在交付成品前完成内容
+覆盖和 EPUB 结构验收。整个流程不调用 LLM，也不访问网络。
+
+### 1. 准备运行环境
+
+以下命令均在本目录 `md2epub/` 中执行：
 
 ```bash
-python3 convert.py <hybrid_output_dir> [--math mathml|svg|png|both]   # 默认 both = mathml+svg
-python3 validate.py <book.epub>                                       # 12 项结构校验
+source ../.venv/bin/activate
+uv pip install -r ../requirements.txt
+npm install
 ```
 
-构建产物（缓存、预处理 md、失败清单、epub）一律生成在**书籍项目目录**——即
-`<hybrid_output_dir>` 的上一级——的 `md2epub-build/` 子目录，不在本仓库（缓存和
-位图是书籍专属的大文件）。诊断脚本（`build_imgtest*.py`、
-`flatten_svg.py --selftest`）从同一位置读取缓存：默认当前书目录，或
-`MD2EPUB_PROJECT` 环境变量 / 首个 CLI 参数覆盖。
+外部命令依赖可通过 Homebrew 安装：
 
-### 按书配置
+```bash
+brew install pandoc librsvg poppler
+```
 
-`--config` 指定书籍专属启发式与断言（默认 `book_config.json` = 数学分析第三版上册；
-`book_config_xinjiang_v1.json` = 数学分析新讲第一册；
-`book_config_xinjiang_v2.json` = 数学分析新讲第二册；
-`book_config_xinjiang_v3.json` = 数学分析新讲第三册）。可覆盖项：章节识别
-（`chapter_regex`）、正文起点注入 H1（`body_start_h1`，用于篇标题页只存在于扫描图
-而 MinerU 未输出标题的情况）、按书字面文本修复（`text_replacements`，如正文里
-`a<b 或是 a>b` 的裸 `<` 会被 pandoc 当伪 HTML 标签原样透传、产出破损 XHTML，
-需转义为 `\<`）、TOC 级 §/附录保留前缀（`keep_h2_prefixes` 列表）、
-垃圾标题模式、期望计数（H1/§/公式数，全部精确断言）、`book_name`（epub 文件名，
-缺省取 md 文件名）、png 尺寸兜底系数 `png_px_per_ex`（默认 8.0，设备校准用）、
-以及内嵌 `metadata`（书名/作者/uuid，转储到构建目录供 pandoc）。
-预处理基线在删除前言/纸质目录**之后**统计（被删部分可能含公式，如"符号说明"页）。
+完整转换需要：
 
-依赖：pandoc ≥ 3.x、node（svg/png 模式，需先在本目录 `npm install`）、
-rsvg-convert（png 模式，`brew install librsvg`）、PyYAML + PIL、pdftoppm、xmllint。
+- `pandoc`：生成 EPUB 和解析 Markdown；
+- `node` 与本目录的 `mathjax-full`：渲染 SVG 公式；
+- `rsvg-convert`（由 `librsvg` 提供）：将公式转为 PNG；
+- `pdftoppm`（由 `poppler` 提供）：从原 PDF 生成封面；
+- Python 包 `PyYAML` 和 `Pillow`。
+
+运行前可检查入口和参数：
+
+```bash
+python md2epub.py --help
+```
+
+### 2. 检查 MinerU 输入目录
+
+命令的位置参数必须是 MinerU 的 `hybrid_auto` 目录，而不是它的上一级书籍目录。
+典型目录如下：
+
+```text
+某本书/
+└── hybrid_auto/
+    ├── 某本书.md
+    ├── 某本书_content_list.json
+    ├── 某本书_content_list_v2.json
+    ├── 某本书_middle.json
+    ├── 某本书_origin.pdf
+    └── images/
+```
+
+规则和降级行为：
+
+- 目录内必须能确定唯一的 Markdown 文件；存在多个候选时不会猜测，需要通过
+  `--config` 的 `md_glob` 明确指定；
+- 优先读取与 Markdown 同名前缀的 `_content_list.json`，其次读取
+  `_content_list_v2.json`；缺少两者时仍可转换，但标题恢复能力会降低并产生警告；
+- `_origin.pdf` 用于生成封面；缺少时 EPUB 仍可生成，但报告会注明没有封面；
+- Markdown 中引用的本地图片必须存在；远程图片不会下载，缺图会使构建失败。
+
+### 3. 首次完整转换
+
+路径含空格或中文时必须加引号：
+
+```bash
+BOOK_DIR="/Users/you/Books/某本书/hybrid_auto"
+python md2epub.py "$BOOK_DIR"
+```
+
+默认 `--math all`，依次生成三版：
+
+```text
+某本书.mathml.epub
+某本书.svg.epub
+某本书.png.epub
+```
+
+默认输出到 `hybrid_auto` 的上一级，即书籍目录。每一版先在临时目录中生成，
+只有通过自动验收后才替换同名成品；某一版失败时，之前通过验收的旧 EPUB 会
+保留。
+
+### 4. 常用命令
+
+只分析输入并生成配置，不构建 EPUB：
+
+```bash
+python md2epub.py "$BOOK_DIR" --analyze-only
+```
+
+只生成或重跑一个公式版本：
+
+```bash
+python md2epub.py "$BOOK_DIR" --math mathml
+python md2epub.py "$BOOK_DIR" --math svg
+python md2epub.py "$BOOK_DIR" --math png
+```
+
+将 EPUB、缓存和报告全部输出到另一个目录：
+
+```bash
+python md2epub.py "$BOOK_DIR" --out-dir "/Users/you/Books/转换结果"
+```
+
+应用书籍专属覆盖配置：
+
+```bash
+python md2epub.py "$BOOK_DIR" --config custom.json
+```
+
+参数说明：
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `hybrid_dir` | 必填 | MinerU 的 `hybrid_auto` 目录 |
+| `--math all` | `all` | 依次生成 MathML、SVG、PNG 三版 |
+| `--math mathml` |  | 仅生成阅读器原生 MathML 版 |
+| `--math svg` |  | 仅生成外链 SVG 公式版 |
+| `--math png` |  | 仅生成兼容性最高的公式位图版 |
+| `--config FILE` | 无 | 用 JSON 覆盖自动识别结果 |
+| `--out-dir DIR` | `hybrid_dir` 上一级 | 指定 EPUB、缓存和报告的共同输出根目录 |
+| `--analyze-only` | 关闭 | 只分析、标准化并生成配置和报告 |
+
+### 5. 覆盖自动配置
+
+覆盖顺序固定为：`book_config.template.json` → 自动识别结果 → `--config`
+指定的 JSON。通常只写需要修改的字段：
+
+```json
+{
+  "book_name": "用于文件名的书名",
+  "md_glob": "唯一的源文件.md",
+  "metadata": {
+    "title": "电子书标题",
+    "author": ["作者"],
+    "translator": ["译者一", "译者二"],
+    "reviewer": ["主审"]
+  },
+  "text_replacements": [
+    ["确定存在的 OCR 原文", "修正后的文字"]
+  ],
+  "png_px_per_ex": 8.0,
+  "png_display_canvas_px": 720
+}
+```
+
+注意：
+
+- `metadata.identifier` 默认由源 Markdown 内容生成稳定 UUID，重跑不会改变；
+- `text_replacements` 是精确字面替换，只应处理已经核对过的 OCR 错误；
+- `png_display_canvas_px` 增大时，弱 CSS 阅读器中的行间公式会变小；减小时会变大；
+- 含 `chapter_regex` 的旧版完整配置会进入兼容流程，用于复现已经校准的数学
+  分析三册。新书应优先使用自动分析加少量覆盖字段。
+
+### 6. 自动转换的详细流程
+
+一次完整运行按以下顺序执行：
+
+1. 检查目录、Python 包及当前公式模式需要的外部命令；
+2. 获取输出目录锁，避免两个进程同时改写同一本书的缓存和成品；
+3. 配对 Markdown、MinerU 内容列表、原始 PDF 和图片；
+4. 分析页面与内容块，保留前言等前置内容，删除有明确页面证据的纸质目录，
+   合并被拆开的章号与章名，并从目录和页眉证据恢复缺失标题；
+5. 生成 `normalized.md` 和 `book_config.generated.json`，同时记录每次结构修改的
+   原页码、原行号和理由；
+6. 在渲染分支之前建立独立内容基线，统计代码块、插图、表格、章节和公式出现
+   次数；围栏代码、缩进代码和行内代码不会参与标题或公式识别；
+7. 分别构建 MathML、外链 SVG 和 PNG 版。公式按 LaTeX、实际行内/行间样式及
+   渲染版本缓存；PNG 从不可变原始位图派生，重跑不会反复裁剪或降低画质；
+8. 检查 ZIP、XML、manifest、spine、目录与锚点、媒体格式、图片哈希、代码块
+   哈希、表格和公式覆盖；PNG 版额外检查空列表项、孤立公式及异常尺寸；
+9. 验收通过后原子替换成品，最后写入汇总报告。无法渲染的 OCR 公式保留原文
+   并作为警告，不会静默丢失。
+
+### 7. 输出文件
+
+默认输出结构：
+
+```text
+某本书/
+├── hybrid_auto/                         # MinerU 原始输出，不会被修改
+├── 某本书.mathml.epub
+├── 某本书.svg.epub
+├── 某本书.png.epub
+└── md2epub-build/
+    ├── book_config.generated.json       # 最终生效的完整配置
+    ├── analysis.json                    # 自动判断、修改证据和内容基线
+    ├── normalized.md                    # 自动整理后的 Markdown
+    ├── metadata.yaml                    # EPUB 元数据
+    ├── preprocessed.mathml.md
+    ├── preprocessed.svg.md
+    ├── preprocessed.png.md
+    ├── math_cache.json                  # MathJax 公式缓存
+    ├── png_cache/                       # 不可变原图及最终公式位图
+    ├── failures.mathml.log
+    ├── failures.svg.log
+    ├── failures.png.log
+    ├── validation.json                  # 每一项自动验收结果
+    ├── report.json                      # 机器可读总报告
+    └── report.md                        # 建议首先阅读的人类可读报告
+```
+
+部分中间文件只在对应模式运行后出现。
+
+### 8. 查看结果和退出状态
+
+首先打开 `md2epub-build/report.md`：
+
+- `success`：所有请求的版本构建成功且没有警告；
+- `success_with_warnings`：所有请求的版本通过验收，但存在公式原文回退、无封面
+  或不可安全拆分的宽公式等非阻塞问题；
+- `failed`：至少一个请求的版本未通过构建或结构验收。
+
+进程退出码：成功及带警告成功为 `0`，失败为 `1`，用户中断为 `130`。
+进一步排查时按此顺序查看：
+
+1. `report.md`：版本结果和警告摘要；
+2. `analysis.json`：删除目录、恢复标题等自动判断的证据；
+3. `failures.<模式>.log`：公式原文、章节位置和上下文；
+4. `validation.json`：失败的具体结构或内容覆盖检查。
+
+也可独立复验成品：
+
+```bash
+python validate.py "/输出目录/某本书.png.epub"
+python audit_png.py "/输出目录/某本书.png.epub" \
+  --config "/输出目录/md2epub-build/book_config.generated.json"
+```
+
+### 9. 重跑、缓存与常见问题
+
+- 直接重复同一命令即可重跑。有效 MathJax 和 PNG 缓存会复用，源 Markdown、
+  图片及 MinerU JSON 不会被修改；
+- 改变 `png_display_canvas_px` 时无需手动删除缓存，最终 PNG 会从不可变原图重新
+  派生；
+- 报错“需要唯一 Markdown”时，在覆盖配置中设置精确的 `md_glob`；
+- 报错“源图片缺失”时，检查 Markdown 的相对路径和 `hybrid_auto/images/`；
+- 报错“已有转换任务正在运行”时，等待同一输出目录中的任务结束；不要同时对
+  同一本书启动两个转换进程；
+- `success_with_warnings` 不表示内容丢失。无法渲染的公式会保留原始 TeX，具体
+  位置在对应的 `failures.<模式>.log`；
+- 自动验收负责可检测的结构、内容覆盖及已知 PNG 排版缺陷。交付到特定硬件前，
+  仍建议在目标阅读器打开封面、目录、代码页和含复杂公式的一章进行最终目视检查。
+
+## 旧版底层入口
+
+`convert.py` 仍可配合 `book_config_xinjiang_v1.json`、
+`book_config_xinjiang_v2.json`、`book_config_xinjiang_v3.json` 使用，以复现已经
+校准的数学分析三册。新书应使用 `md2epub.py`，因为底层入口不会自动生成配置、
+内容基线和统一验收报告。
 
 ## 三种公式模式（兼容性金字塔）
 

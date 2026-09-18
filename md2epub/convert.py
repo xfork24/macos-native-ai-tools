@@ -24,9 +24,26 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import contextlib
+import os
+from markdown_regions import protect_code, restore_code, mask_code, map_prose
 from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
+
+def atomic_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target_mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    fd, temp = tempfile.mkstemp(prefix=path.name+".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        os.chmod(temp, target_mode)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
 
 DEFAULTS = {
     "md_glob": "*.md",
@@ -77,14 +94,10 @@ DEFAULTS = {
 }
 
 # Display math is always a multi-line block: "$$\n<latex>\n$$".
-DISPLAY_MATH_RE = re.compile(r"\$\$\n(.*?)\n\$\$", re.S)
-# Inline math follows pandoc's tex_math_dollars rules: opening '$' followed by
-# a non-space, closing '$' preceded by a non-space and not followed by a digit.
-INLINE_MATH_RE = re.compile(r"\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)")
-# Combined splitter used by the svg layer (display branch wins at each position).
-MATH_SPLIT_RE = re.compile(
-    r"\$\$\n(.*?)\n\$\$|\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)", re.S
-)
+DISPLAY_MATH_RE = re.compile(r"(?<!\\)\$\$[ \t]*\n?(.*?)\n?\$\$", re.S)
+INLINE_MATH_RE = re.compile(r"(?<![\\$])\$(?![\s$])([^$\n]+?)(?<![\s\\])\$(?![\d$])")
+MATH_SPLIT_RE = re.compile(DISPLAY_MATH_RE.pattern + "|" + INLINE_MATH_RE.pattern, re.S)
+
 
 
 class ConvertError(RuntimeError):
@@ -93,10 +106,14 @@ class ConvertError(RuntimeError):
 
 def load_config(path: Path) -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
+    if not path.is_file():
+        raise ConvertError(f"config not found: {path}")
     if path.exists():
         user = json.loads(path.read_text(encoding="utf-8"))
+        if user.get("schema_version") == 2:
+            cfg = {}
         for key, value in user.items():
-            if key == "expected" and isinstance(value, dict):
+            if key == "expected" and isinstance(value, dict) and "expected" in cfg:
                 cfg["expected"].update(value)
             else:
                 cfg[key] = value
@@ -107,11 +124,14 @@ def find_md(hybrid_dir: Path, cfg: dict) -> Path:
     candidates = [p for p in hybrid_dir.glob(cfg["md_glob"]) if p.is_file()]
     if not candidates:
         raise ConvertError(f"no markdown file matching {cfg['md_glob']!r} in {hybrid_dir}")
-    return max(candidates, key=lambda p: p.stat().st_size)
+    if len(candidates) != 1:
+        raise ConvertError("multiple markdown files; specify md_glob in config")
+    return candidates[0]
 
 
 def count_math(text: str) -> tuple[int, int]:
     """Return (display_block_count, inline_span_count)."""
+    text = mask_code(text)
     display = len(DISPLAY_MATH_RE.findall(text))
     without_display = DISPLAY_MATH_RE.sub(" ", text)
     inline = len(INLINE_MATH_RE.findall(without_display))
@@ -180,7 +200,7 @@ def _repair_latex(latex: str) -> str:
     # width="100%" full-line table (no root viewBox — unsizable for
     # rasterisation, the probe renders it at internal scale and the bitmap
     # collapses to a vertical sliver), and texmath rejects \tag outright.
-    latex = re.sub(r"\\tag\s*\{[^{}]*\}", "", latex)
+    latex = re.sub(r"\\tag\s*\{([^{}]*)\}", lambda m: r"\quad\text{(" + m[1] + ")}", latex)
     # Stray inline delimiters pasted inside a math body by OCR
     # ("$$\(| \sin x | …$$") — texmath rejects them outright.
     latex = re.sub(r"^\\\(\s*", "", latex)
@@ -190,11 +210,11 @@ def _repair_latex(latex: str) -> str:
 
 def _apply_to_math(text: str, fn) -> str:
     """Apply fn to the LaTeX body of every math span (display first)."""
-    text = DISPLAY_MATH_RE.sub(lambda m: f"$$\n{fn(m.group(1))}\n$$", text)
-    return INLINE_MATH_RE.sub(lambda m: f"${fn(m.group(1))}$", text)
+    return map_prose(text, lambda t: MATH_SPLIT_RE.sub(
+        lambda m: f"$$\n{fn(m.group(1))}\n$$" if m.group(1) is not None else f"${fn(m.group(2))}$", t))
 
 
-def preprocess(text: str, cfg: dict) -> str:
+def _preprocess_legacy(text: str, cfg: dict) -> str:
     """Apply the ordered cleanup transforms; returns cleaned markdown."""
 
     # 1. NUL repair (apostrophes, empty tags, stray bytes in headers).
@@ -312,6 +332,35 @@ def preprocess(text: str, cfg: dict) -> str:
     return text
 
 
+def preprocess(text: str, cfg: dict) -> str:
+    """代码保持原样；新版配置已完成结构分析，旧配置仍走原来的分级规则。"""
+    protected, saved = protect_code(text)
+    if not cfg.get("prepared"):
+        return restore_code(_preprocess_legacy(protected, cfg), saved)
+    for old, new in cfg.get("text_replacements", []):
+        protected = protected.replace(old, new)
+    protected = _fix_nul_in_headers(protected).replace("\x00", "")
+    protected = _normalize_inline_math(protected)
+    protected = _apply_to_math(protected, _repair_latex)
+    # Escape pseudo-tags such as a<b; legitimate HTML remains available.
+    allowed = {"table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "col", "colgroup",
+               "sub", "sup", "div", "span", "p", "br", "hr", "img", "a", "em", "strong", "b", "i", "code", "pre"}
+    def safe_tag(m):
+        value = m.group(0)
+        tag = re.match(r"</?([A-Za-z][A-Za-z0-9]*)", value)
+        if tag and tag[1].lower() in allowed and re.match(r"</?\w+(?:\s+[\w:-]+\s*=|\s*/?>)", value):
+            return value
+        return html.escape(value, quote=False)
+    # Formula text must not be HTML-escaped before rendering.
+    pieces = []
+    cursor = 0
+    for m in MATH_SPLIT_RE.finditer(protected):
+        pieces.append(re.sub(r"</?[A-Za-z][^>\n]*>", safe_tag, protected[cursor:m.start()]))
+        pieces.append(m.group(0)); cursor = m.end()
+    pieces.append(re.sub(r"</?[A-Za-z][^>\n]*>", safe_tag, protected[cursor:]))
+    return restore_code(_strip_junk_subsup(''.join(pieces)), saved)
+
+
 # --------------------------------------------------------------------------
 # svg math layer
 # --------------------------------------------------------------------------
@@ -324,19 +373,20 @@ def tokenise_math(text: str) -> tuple[str, dict]:
     """Replace every formula with a placeholder token; collect render jobs."""
     if "⟂" in text:
         raise ConvertError("token character ⟂ already present in source")
+    text, saved = protect_code(text)
     jobs: dict[str, dict] = {}
 
     def repl(match: re.Match) -> str:
         display = match.group(1) is not None
         latex = match.group(1) if display else match.group(2)
-        key = _hash(latex)
+        key = _hash(("display:" if display else "inline:") + latex)
         job = jobs.setdefault(key, {"latex": latex, "display": display})
         if job["display"] != display:
             job["display"] = display  # same latex in both roles; block wins
         kind = "MATHD" if job["display"] else "MATHI"
         return f"\n⟂{kind}:{key}⟂\n" if job["display"] else f"⟂MATHI:{key}⟂"
 
-    return MATH_SPLIT_RE.sub(repl, text), jobs
+    return restore_code(MATH_SPLIT_RE.sub(repl, text), saved), jobs
 
 
 def _png_ok(p: Path) -> bool:
@@ -906,18 +956,46 @@ def _reflow_numbered_math_lines(
 def render_math_via_node(
     jobs: dict, build_dir: Path, cache_path: Path, force: bool = False
 ) -> tuple[dict, dict]:
-    """Render uncached formulas through render_math.js; persist the cache.
+    """Render formulas through MathJax with independent style variants.
 
-    force: re-render exactly these jobs even if cached (used to replace a
-    formula's rendering style under the smart-classification pass).
+    A formula used in SVG mode with its source role and then flipped by the
+    PNG heuristics must retain both renderings.  The persistent variant key
+    includes the TeX and actual display flag; the ordinary job key is only
+    an in-memory/current-run alias.  ``force`` remains API-compatible, but
+    an exact cached variant is already authoritative and is reused.
     """
     cache: dict = {}
     if cache_path.exists():
-        cache = json.loads(cache_path.read_text(encoding="utf-8"))
-    todo = {
-        k: v for k, v in jobs.items()
-        if force or k not in cache
-    }
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            print("  warning: unreadable formula cache; regenerating")
+    todo = {}
+    cache_changed = False
+    variants = {}
+    for key, job in jobs.items():
+        signature = _hash(
+            "v4:" + str(job["display"]) + ":" + job["latex"]
+        )
+        variant_key = f"{key}@{signature}"
+        variants[key] = (variant_key, signature)
+        if variant_key in cache:
+            cache[key] = dict(cache[variant_key])
+            continue
+        legacy_signature = _hash(
+            "v3:" + str(job["display"]) + job["latex"]
+        )
+        if (
+            key in cache
+            and cache[key].get("signature") == legacy_signature
+        ):
+            migrated = dict(cache[key])
+            migrated["signature"] = signature
+            cache[variant_key] = migrated
+            cache[key] = dict(migrated)
+            cache_changed = True
+            continue
+        todo[key] = job
     if todo:
         in_path = build_dir / "math.in.json"
         out_path = build_dir / "math.out.json"
@@ -935,11 +1013,15 @@ def render_math_via_node(
         for key, err in errors.items():
             results[key] = {"error": err}
         print(f"  rendered: {len(results) - len(errors)} ok, {len(errors)} failed")
-        cache.update(results)
-        for key in todo:
-            if key in cache:
-                cache[key]["rendered_display"] = todo[key]["display"]
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        for key, entry in results.items():
+            entry["rendered_display"] = todo[key]["display"]
+            variant_key, signature = variants[key]
+            entry["signature"] = signature
+            cache[variant_key] = dict(entry)
+            cache[key] = dict(entry)
+        atomic_text(cache_path, json.dumps(cache, ensure_ascii=False))
+    elif cache_changed:
+        atomic_text(cache_path, json.dumps(cache, ensure_ascii=False))
     missing = [k for k in jobs if k not in cache]
     if missing:
         raise ConvertError(f"{len(missing)} formulas missing from render results")
@@ -1059,7 +1141,7 @@ def inject_svg_math(
         if text_html:
             return f'\n<div class="math-display">&#8203;\n{text_html}{tail}\n</div>\n'
         img = _img(key, display=True)
-        if img is None:
+        if img is None and png_meta is None:
             entry = cache.get(key) or {}
             if "svg" in entry:
                 img = _svg_ref(key, entry, display=True)
@@ -1072,31 +1154,20 @@ def inject_svg_math(
             if tail:
                 return f'\n<p>{img}</p>\n<p class="math-tail">{tail}</p>\n'
             return f'\n<p>{img}</p>\n'
-        entry = cache.get(key) or {}
-        if "svg" not in entry:
-            return _raw_fallback(jobs[key]["latex"])
-        svg = re.sub(r"\s+", " ", entry["svg"]).strip()
-        return f'\n<div class="math-display">\n{svg}\n</div>\n'
+        return _raw_fallback(jobs[key]["latex"])
 
     def inline_span(key: str) -> str:
         text_html = jobs[key].get("text_html")
         if text_html:
             return text_html
         img = _img(key, display=False)
-        if img is None:
+        if img is None and png_meta is None:
             entry = cache.get(key) or {}
             if "svg" in entry:
                 img = _svg_ref(key, entry, display=False)
         if img is not None:
             return img
-        entry = cache.get(key) or {}
-        if "svg" not in entry:
-            return _raw_fallback(jobs[key]["latex"])
-        svg = re.sub(r"\s+", " ", entry["svg"]).strip()
-        valign = entry.get("valign_ex", 0)
-        return (
-            f'<span class="math-inline" style="vertical-align:{valign:g}ex">{svg}</span>'
-        )
+        return _raw_fallback(jobs[key]["latex"])
 
     # Standalone display tokens arrive as <p>⟂MATHD:…⟂</p> — swap the whole
     # paragraph for the block. Tokens in other containers (li, blockquote)
@@ -1164,133 +1235,68 @@ def render_pngs(
     display_keys: set[str] | None = None, px_per_ex: float = 8.0,
     canvas_px: int = DISPLAY_CANVAS_PX,
 ) -> dict[str, list[tuple[str, float, float]]]:
-    """Rasterise every cached SVG formula to PNG (2x, capped 1600px wide).
-
-    Returns {key: [("", width_ex, height_ex)]} — the caller needs the
-    ex-dimensions to size the <img> in CSS units so formulas scale with the
-    reader's font size. `skip` drops keys whose formulas render as HTML
-    text (no bitmap needed). Display-key bitmaps are centred on a common
-    transparent canvas `canvas_px` wide (see DISPLAY_CANVAS_PX) and their
-    meta becomes the canvas box, so the img can keep aspect against the
-    padded bitmap on every engine.
-    """
-    from concurrent.futures import ThreadPoolExecutor
+    """从不可变原始位图派生画布；重复执行不会裁剪、重采样或重复应用透明度。"""
     from PIL import Image
-
+    from io import BytesIO
+    from concurrent.futures import ThreadPoolExecutor
     png_dir.mkdir(parents=True, exist_ok=True)
-    disp = display_keys or set()
-    meta: dict[str, list[tuple[str, float, float]]] = {}
-    jobs: list[tuple[Path, Path, int]] = []
-
+    raw_dir = png_dir / "raw-v3"
+    raw_dir.mkdir(exist_ok=True)
+    meta, tasks = {}, []
     for key, entry in cache.items():
-        if "svg" not in entry or (skip and key in skip):
+        if "svg" not in entry or key in (skip or set()):
             continue
-        root_tag = entry["svg"][: entry["svg"].index(">")]
-        m = re.search(r'width="([\d.]+)ex" height="([\d.]+)ex"', root_tag)
-        if m:
-            w_ex, h_ex = float(m.group(1)), float(m.group(2))
-        else:
-            # Stretch tables get width="100%": aspect from the ROOT viewBox,
-            # or — when even that is absent — from a probe render. (The first
-            # viewBox in the string belongs to a nested svg and is degenerate.)
-            h_m = re.search(r'height="([\d.]+)ex"', root_tag)
-            if not h_m:
+        dims = _svg_ex_dims(entry["svg"])
+        if dims is None:
+            root = entry["svg"].split(">", 1)[0]
+            hm = re.search(r'height="([\d.]+)ex"', root)
+            if not hm:
                 continue
-            h_ex = float(h_m.group(1))
-            vb = re.search(
-                r'viewBox="(-?[\d.]+) (-?[\d.]+) ([\d.]+) ([\d.]+)"', root_tag
-            )
-            if vb:
-                w_ex = h_ex * float(vb.group(3)) / float(vb.group(4))
-            else:
-                w_ex = h_ex * _probe_ink_aspect(entry["svg"], png_dir, key)
+            h_ex = float(hm[1])
+            dims = (h_ex * _probe_ink_aspect(entry["svg"], png_dir, key), h_ex)
+        w_ex, h_ex = dims
+        if not all(math.isfinite(v) and v > 0 for v in dims):
+            continue
+        display = key in (display_keys or set())
+        scale = DISPLAY_RASTER_SCALE if display else RASTER_SCALE
+        cap = DISPLAY_RASTER_CAP if display else 1600
+        width = max(min(round(w_ex * px_per_ex * scale), cap), 8)
+        signature = _hash("png-v3:"+entry["svg"]+str((width, RASTER_COLORS)))
+        raw = raw_dir / f"{signature}.png"
         meta[key] = [("", w_ex, h_ex)]
-        out = png_dir / f"eq-{key}.png"
-        if out.exists() and _png_ok(out):
-            continue
-        svg_file = png_dir / f"eq-{key}.svg"
-        svg_file.write_text(entry["svg"], encoding="utf-8")
-        scale, cap = (
-            (DISPLAY_RASTER_SCALE, DISPLAY_RASTER_CAP) if key in disp
-            else (RASTER_SCALE, 1600)
-        )
-        jobs.append(
-            (svg_file, out, max(min(round(w_ex * 8 * scale), cap), 8))
-        )
-
-    def _rsvg(job: tuple[Path, Path, int]) -> None:
-        svg_file, out, width_px = job
-        subprocess.run(
-            ["rsvg-convert", "--width", str(width_px), "-o", str(out), str(svg_file)],
-            check=True, capture_output=True,
-        )
-
-    if jobs:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for _ in pool.map(_rsvg, jobs):
-                pass
-        for svg_file, _, _ in jobs:
-            svg_file.unlink()
-        print(f"  rasterised {len(jobs)} formulas -> {png_dir.name}/")
-
-    # Palette quantisation (RGBA→P32): line-art glyphs compress ~4x smaller
-    # than grayscale+alpha with no visible loss on 16-level e-ink panels.
-    for _, out, _ in jobs:
-        try:
-            with Image.open(out) as im:
-                im.convert("RGBA").quantize(
-                    colors=RASTER_COLORS, method=2  # FASTOCTREE
-                ).save(out, optimize=True)
-        except OSError as exc:
-            print(f"  warning: png optimise failed for {out.name}: {exc}")
-
-    # One-time cleanup of the abandoned strip experiment (see the sizing
-    # comment block above the FALLBACK_BOX_PX constants).
-    for old in png_dir.glob("eq-*-p*.png"):
-        old.unlink()
-    (png_dir / "strips.json").unlink(missing_ok=True)
-
-    # Display-bitmap canvas pass: centring the content on a common
-    # transparent canvas is what calibrates glyph size on iReader (it
-    # renders image paragraphs ~full-width by bitmap aspect). A bitmap wider
-    # than its content is padding from an earlier canvas width (padded
-    # bitmaps are exactly canvas-wide, content centred) — crop the content
-    # back out first, so changing the canvas re-pads correctly in BOTH
-    # directions. meta keeps the CONTENT ex-dims — the display markup
-    # derives the canvas box from them (see _img).
-    # The config knob is calibrated in RASTER_SCALE-density px; the physical
-    # canvas bitmap runs at DISPLAY_RASTER_SCALE density (same ex geometry).
-    canvas_w = round(canvas_px * DISPLAY_RASTER_SCALE / RASTER_SCALE)
-    n_pad = 0
-    for key in display_keys or ():
-        if key not in meta:
-            continue
-        _, w_ex, _ = meta[key][0]
-        out = png_dir / f"eq-{key}.png"
-        with Image.open(out) as im:
-            w, h = im.size
-            w_content = max(
-                min(round(w_ex * 8 * DISPLAY_RASTER_SCALE), DISPLAY_RASTER_CAP), 8
-            )
-            if w > w_content:  # strip previous canvas padding (centred)
-                x0 = (w - w_content) // 2
-                im = im.crop((x0, 0, x0 + w_content, h))
-                w = w_content
-            if w >= canvas_w:
-                continue  # wide content: canvas would add nothing
-            rgba = im.convert("RGBA")
-        canvas = Image.new("RGBA", (canvas_w, h), (0, 0, 0, 0))
-        canvas.paste(rgba, ((canvas_w - w) // 2, 0), rgba)
-        canvas.quantize(colors=RASTER_COLORS, method=2).save(
-            out, optimize=True
-        )
-        n_pad += 1
-    if n_pad:
-        print(
-            f"  display canvas: centred {n_pad} bitmaps on {canvas_w}px "
-            f"@ {DISPLAY_RASTER_SCALE // RASTER_SCALE}x density "
-            f"(calibration {canvas_px}px)"
-        )
+        tasks.append((key, entry["svg"], raw, width, display))
+    def build(task):
+        key, svg, raw, width, display = task
+        if not _png_ok(raw):
+            proc = subprocess.run(["rsvg-convert", "--width", str(width)],
+                                  input=svg.encode(), capture_output=True, check=True)
+            with Image.open(BytesIO(proc.stdout)) as im:
+                im.convert("RGBA").quantize(colors=RASTER_COLORS, method=2).save(raw, optimize=True)
+        with Image.open(raw) as original:
+            rgba = original.convert("RGBA")
+            canvas_width = round(canvas_px * DISPLAY_RASTER_SCALE / RASTER_SCALE)
+            if display and rgba.width < canvas_width:
+                canvas = Image.new("RGBA", (canvas_width, rgba.height), (0, 0, 0, 0))
+                canvas.paste(rgba, ((canvas_width-rgba.width)//2, 0))
+                result = canvas.quantize(colors=RASTER_COLORS, method=2)
+            else:
+                result = original.copy()
+            buf = BytesIO(); result.save(buf, format="PNG", optimize=True)
+        target = png_dir / f"eq-{key}.png"
+        data = buf.getvalue()
+        if not target.exists() or target.read_bytes() != data:
+            temp = target.with_suffix(".tmp")
+            temp.write_bytes(data); temp.replace(target)
+    # Unique role-based keys may share raw images; serialize each raw cache key.
+    grouped = {}
+    for task in tasks:
+        grouped.setdefault(task[2], []).append(task)
+    def group_build(group):
+        for task in group:
+            build(task)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(group_build, grouped.values()))
+    print(f"  png: {len(tasks)} current formulas, immutable raw cache")
     return meta
 
 
@@ -1371,6 +1377,52 @@ def run_pandoc(
         cmd += ["--mathml"]
     cmd += ["--output", str(out_epub)]
     subprocess.run(cmd, cwd=hybrid_dir, check=True)
+    _add_contributor_metadata(out_epub, _read_metadata(metadata_path))
+
+
+def _add_contributor_metadata(epub_path: Path, meta: dict) -> None:
+    """Add explicit MARC roles that Pandoc's YAML reader does not emit."""
+    people = [
+        ("translator", "trl", meta.get("translator", [])),
+        ("reviewer", "rev", meta.get("reviewer", [])),
+    ]
+    if not any(names for _, _, names in people):
+        return
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=epub_path.name + ".", suffix=".tmp", dir=epub_path.parent
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(epub_path) as source, zipfile.ZipFile(
+            tmp, "w", zipfile.ZIP_DEFLATED
+        ) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename.endswith(".opf"):
+                    opf = data.decode("utf-8")
+                    additions = []
+                    for prefix, role, names in people:
+                        for i, name in enumerate(names, 1):
+                            ident = f"{prefix}{i}"
+                            additions.append(
+                                f'<dc:contributor id="{ident}">'
+                                f'{html.escape(str(name))}</dc:contributor>'
+                                f'<meta refines="#{ident}" property="role" '
+                                f'scheme="marc:relators">{role}</meta>'
+                            )
+                    opf = opf.replace(
+                        "</metadata>", "".join(additions) + "</metadata>"
+                    )
+                    data = opf.encode("utf-8")
+                if info.filename == "mimetype":
+                    target.writestr(info, data, compress_type=zipfile.ZIP_STORED)
+                else:
+                    target.writestr(info, data)
+        os.chmod(tmp, epub_path.stat().st_mode)
+        os.replace(tmp, epub_path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -1378,18 +1430,17 @@ def run_pandoc(
 # --------------------------------------------------------------------------
 
 def _split_sections(md_text: str) -> list[dict]:
-    """Split at H1/H2 lines; every section becomes one output XHTML file."""
     sections, cur = [], None
-    for line in md_text.split("\n"):
-        m1 = re.match(r"^# (.+)$", line)
-        m2 = re.match(r"^## (.+)$", line)
-        if m1 or m2:
+    for line, visible in zip(md_text.split("\n"), mask_code(md_text).split("\n")):
+        m = re.match(r"^(#{1,2}) (.+)$", visible)
+        if m:
             if cur is not None:
                 sections.append(cur)
-            level = 1 if m1 else 2
-            cur = {"level": level, "title": (m1 or m2).group(1).strip(), "lines": [line]}
+            cur = {"level": len(m[1]), "title": line[len(m[1])+1:].strip(), "lines": [line]}
         elif cur is not None:
             cur["lines"].append(line)
+        elif line.strip():
+            cur = {"level": 1, "title": "正文", "lines": ["# 正文", "", line]}
     if cur is not None:
         sections.append(cur)
     return sections
@@ -1446,7 +1497,7 @@ def _nav_and_ncx(toc: list[dict], meta: dict) -> tuple[str, str]:
         ncx_points.append(
             f'<navPoint id="np{play}" playOrder="{play}">'
             f"<navLabel><text>{esc(top['title'])}</text></navLabel>"
-            f'<content src="text/{top["file"]}"/></navPoint>'
+            f'<content src="text/{top["file"]}"/>'
         )
         for child in top["children"]:
             play += 1
@@ -1455,6 +1506,8 @@ def _nav_and_ncx(toc: list[dict], meta: dict) -> tuple[str, str]:
                 f"<navLabel><text>{esc(child['title'])}</text></navLabel>"
                 f'<content src="text/{child["file"]}"/></navPoint>'
             )
+        ncx_points.append("</navPoint>")
+    body_node = next((t for t in toc if t["title"] == meta.get("body_title")), toc[0])
     nav = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<!DOCTYPE html>\n'
@@ -1468,7 +1521,7 @@ def _nav_and_ncx(toc: list[dict], meta: dict) -> tuple[str, str]:
         f"<ol>{''.join(nav_lis)}</ol>\n"
         "</nav>\n"
         '<nav epub:type="landmarks" hidden="hidden"><h1>导航</h1><ol>\n'
-        f'<li><a epub:type="bodymatter" href="text/{toc[1]["file"] if len(toc) > 1 else toc[0]["file"]}">正文</a></li>\n'
+        f'<li><a epub:type="bodymatter" href="text/{body_node["file"]}">正文</a></li>\n'
         "</ol></nav>\n"
         "</body>\n</html>\n"
     )
@@ -1504,7 +1557,8 @@ def build_epub_chunked(
     sections = _split_sections(md_text)
     # Transient staging in a fresh tempdir — never inside the tool repo, and
     # unique per run (no cleanup races).
-    staging = Path(tempfile.mkdtemp(prefix="md2epub-stage-"))
+    stage_context = tempfile.TemporaryDirectory(prefix="md2epub-stage-")
+    staging = Path(stage_context.name)
     for sub in ("text", "media", "styles"):
         (staging / "EPUB" / sub).mkdir(parents=True, exist_ok=True)
     shutil.copyfile(
@@ -1517,6 +1571,7 @@ def build_epub_chunked(
     spine_files: list[str] = []
     for i, sec in enumerate(sections, 1):
         xhtml = _md_fragment_to_xhtml("\n".join(sec["lines"]), sec["title"])
+        xhtml = xhtml.replace('lang="zh-CN"', f'lang="{html.escape(meta.get("lang", "zh-CN"), quote=True)}"')
         # Collect + rewrite image references into EPUB/media.
         def _img(match: re.Match) -> str:
             src = match.group(1)
@@ -1527,8 +1582,7 @@ def build_epub_chunked(
                     shutil.copyfile(src_file, staging / "EPUB" / "media" / media_name)
                     media[src] = media_name
                 else:
-                    print(f"  warning: image not found: {src}")
-                    media[src] = None
+                    raise ConvertError(f"image not found: {src}")
             return f'src="../media/{media[src]}"' if media[src] else 'src=""'
 
         xhtml = re.sub(r'src="(images/[^"]+)"', _img, xhtml)
@@ -1563,7 +1617,9 @@ def build_epub_chunked(
         fname = f"ch{i:03d}.xhtml"
         (staging / "EPUB" / "text" / fname).write_text(xhtml, encoding="utf-8")
         spine_files.append(fname)
-        node = {"file": fname, "title": sec["title"], "children": []}
+        nav_title = re.sub(r"⟂MATH[DI]:([0-9a-f]+)⟂", lambda m: jobs[m[1]]["latex"], sec["title"])
+        nav_title = html.unescape(re.sub(r"<[^>]+>", "", nav_title)).replace("\\_", "_")
+        node = {"file": fname, "title": nav_title, "children": []}
         if sec["level"] == 1:
             toc.append(node)
         elif toc:
@@ -1572,6 +1628,7 @@ def build_epub_chunked(
             toc.append(node)
 
     nav, ncx = _nav_and_ncx(toc, meta)
+    nav = nav.replace('lang="zh-CN"', f'lang="{html.escape(meta.get("lang", "zh-CN"), quote=True)}"')
     (staging / "EPUB" / "nav.xhtml").write_text(nav, encoding="utf-8")
     (staging / "EPUB" / "toc.ncx").write_text(ncx, encoding="utf-8")
 
@@ -1673,6 +1730,18 @@ def build_epub_chunked(
         + "".join(
             f"<dc:creator>{html.escape(a)}</dc:creator>" for a in meta["author"]
         )
+        + "".join(
+            f'<dc:contributor id="translator{i}">{html.escape(a)}</dc:contributor>'
+            f'<meta refines="#translator{i}" property="role" '
+            f'scheme="marc:relators">trl</meta>'
+            for i, a in enumerate(meta.get("translator", []), 1)
+        )
+        + "".join(
+            f'<dc:contributor id="reviewer{i}">{html.escape(a)}</dc:contributor>'
+            f'<meta refines="#reviewer{i}" property="role" '
+            f'scheme="marc:relators">rev</meta>'
+            for i, a in enumerate(meta.get("reviewer", []), 1)
+        )
         + f'<dc:language>{html.escape(meta.get("lang", "zh-CN"))}</dc:language>\n'
         f'<dc:date>{html.escape(str(meta.get("date", "")))}</dc:date>\n'
         f'<meta property="dcterms:modified">{now}</meta>\n'
@@ -1693,7 +1762,7 @@ def build_epub_chunked(
         for path in sorted(staging.rglob("*")):
             if path.is_file():
                 zf.write(path, path.relative_to(staging).as_posix())
-    shutil.rmtree(staging, ignore_errors=True)
+    stage_context.cleanup()
 
 
 # --------------------------------------------------------------------------
@@ -1702,6 +1771,7 @@ def build_epub_chunked(
 
 def _occurrence_index(text: str) -> dict[str, list[dict]]:
     """latex -> [{'kind','chapter','section','idx','context'}] in doc order."""
+    text = mask_code(text)
     chapters = [
         (m.start(), m.group(1).strip())
         for m in re.finditer(r"^# (.+)$", text, re.M)
@@ -1820,10 +1890,10 @@ def write_failure_log(
         matched = [x for x in counts if x in occ]
         unmatched = [x for x in counts if x not in occ]
         lines += _format_failures(
-            "mathml 模式 — texmath 无法转换的公式（OCR 乱码）",
+            "mathml 模式 — texmath 无法转换的公式（渲染失败）",
             "  说明: pandoc 将这些公式按原始 TeX 文本嵌入"
             f"（<span class=\"math\">，共 {sum(counts.values())} 处）；"
-            "成因是 LaTeX 源本身为 OCR 乱码，非转换器缺陷，修复需人工核对原书。",
+            "可能是源识别错误或渲染器不支持；原文已保留，详见定位。",
             matched,
             occ,
         )
@@ -1832,13 +1902,13 @@ def write_failure_log(
             for latex in unmatched[:10]:
                 lines.append(f"      {latex[:100]}")
 
-    if "svg" in modes and svg_cache is not None and svg_jobs is not None:
+    if any(m in modes for m in ("svg", "png")) and svg_cache is not None and svg_jobs is not None:
         failed_hashes = [k for k, v in svg_cache.items() if "svg" not in v]
         failed_latices = [svg_jobs[h]["latex"] for h in failed_hashes if h in svg_jobs]
         lines += _format_failures(
-            "svg 模式 — MathJax 渲染失败的公式（OCR 乱码）",
+            "svg/png 模式 — MathJax 渲染失败的公式（渲染失败）",
             "  说明: 输出为 <code class=\"math-raw\"> 原始 TeX 文本；"
-            "与 mathml 模式的失败高度重叠（同为 OCR 乱码）。",
+            "原文已保留；具体原因见缓存 error 字段。",
             failed_latices,
             occ,
         )
@@ -1886,7 +1956,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("hybrid_dir", type=Path, help="MinerU output directory")
     parser.add_argument(
-        "--math", choices=("mathml", "svg", "png", "both"), default="both",
+        "--math", choices=("mathml", "svg", "png", "both", "all"), default="both",
         help="formula rendering mode (default: both = mathml + svg)",
     )
     parser.add_argument(
@@ -1894,6 +1964,8 @@ def main(argv: list[str] | None = None) -> int:
         help="per-book heuristic overrides (json)",
     )
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--build-dir", type=Path, default=None)
+    parser.add_argument("--source-md", type=Path, default=None)
     args = parser.parse_args(argv)
 
     hybrid_dir = args.hybrid_dir.resolve()
@@ -1904,8 +1976,9 @@ def main(argv: list[str] | None = None) -> int:
     # Build artifacts (caches, preprocessed md, failure log) live with the
     # book — the directory containing the MinerU output — not in the tool
     # repo: they are book-specific and large.
-    out_dir = args.out_dir or hybrid_dir.parent
-    build_dir = hybrid_dir.parent / "md2epub-build"
+    out_dir = (args.out_dir or hybrid_dir.parent).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    build_dir = args.build_dir or out_dir / "md2epub-build"
     build_dir.mkdir(parents=True, exist_ok=True)
     # Per-book metadata may live inline in the config (dumped to the build
     # dir for pandoc) instead of the repo's default metadata.yaml.
@@ -1917,14 +1990,14 @@ def main(argv: list[str] | None = None) -> int:
         metadata_path.write_text(
             yaml.safe_dump(cfg["metadata"], allow_unicode=True), encoding="utf-8"
         )
-    md_path = find_md(hybrid_dir, cfg)
+    md_path = args.source_md or find_md(hybrid_dir, cfg)
     book_stem = cfg.get("book_name") or md_path.stem
     print(f"source md: {md_path.name} ({md_path.stat().st_size / 1e6:.2f} MB)")
     text = preprocess(md_path.read_text(encoding="utf-8"), cfg)
     if cfg.get("colophon_enabled"):
         text = cfg["colophon_md"].rstrip("\n") + "\n\n" + text
 
-    modes = ["mathml", "svg"] if args.math == "both" else [args.math]
+    modes = ["mathml", "svg", "png"] if args.math == "all" else ["mathml", "svg"] if args.math == "both" else [args.math]
     cover = make_cover(hybrid_dir, build_dir, cfg)
     warnings: list[str] = []
     if cover is None:
@@ -1959,9 +2032,8 @@ def main(argv: list[str] | None = None) -> int:
                 render_jobs, build_dir, build_dir / "math_cache.json"
             )
             svg_cache, svg_jobs = cache, jobs
-            if "$" in tokenised:
-                raise ConvertError("'$' remains after tokenisation — untokenised math?")
-            md_text = tokenised
+            # Ordinary dollars and dollars in code are not formula errors.
+            md_text, code_saved = protect_code(tokenised)
             if mode == "png":
                 # Inline tokens living on lines that must never be re-flowed
                 # (headings/tables/quotes/list items) cannot take the
@@ -2096,7 +2168,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 svg_cache, svg_jobs = cache, jobs
                 png_meta = render_pngs(
-                    cache,
+                    {k: cache[k] for k in jobs if k in cache},
                     build_dir / "png_cache",
                     skip={k for k, j in jobs.items() if "text_html" in j},
                     display_keys={k for k, j in jobs.items() if j["display"]},
@@ -2105,6 +2177,8 @@ def main(argv: list[str] | None = None) -> int:
                         "png_display_canvas_px", DISPLAY_CANVAS_PX
                     ),
                 )
+        if mode != "mathml":
+            md_text = restore_code(md_text, code_saved)
         md_out = build_dir / f"preprocessed.{mode}.md"
         md_out.write_text(md_text, encoding="utf-8")
         out_epub = out_dir / f"{book_stem}.{mode}.epub"
@@ -2129,13 +2203,6 @@ def main(argv: list[str] | None = None) -> int:
 
     log_path = build_dir / "failures.log"
     log_modes = list(modes)
-    if "mathml" not in log_modes:
-        # A png/svg-only run must not lose the mathml section of the log:
-        # parse the mathml epub built by an earlier run in this directory.
-        existing = out_dir / f"{book_stem}.mathml.epub"
-        if existing.exists():
-            mathml_epub = existing
-            log_modes.append("mathml")
     write_failure_log(
         log_path,
         source_name=md_path.name,

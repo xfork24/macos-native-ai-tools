@@ -65,3 +65,7 @@ img.math-inline {
 code.math-raw { font-size: .85em; opacity: .8; }
 
 sub, sup { font-size: .72em; line-height: 0; }
+
+/* 程序设计内容：保持空白，长行可换行，不给代码应用段落缩进。 */
+pre { white-space: pre-wrap; overflow-wrap: anywhere; text-indent: 0; text-align: left; line-height: 1.35; font-size: .85em; }
+pre code { white-space: inherit; font-family: monospace; }
