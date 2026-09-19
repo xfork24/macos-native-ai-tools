@@ -117,6 +117,15 @@ def run(directory: Path, out_dir: Path | None = None, modes=None, overrides=None
         for mode in modes:
             print(f'\n📚 {mode}: 开始构建与验收',flush=True)
             mode_result={}
+            failure=build/'failures.log'
+            mode_failure=build/f'failures.{mode}.log'
+            error_log=build/f'error.{mode}.log'
+            # Diagnostics are current-run evidence.  Do not let a failed
+            # converter inherit the preceding mode's shared failure log or
+            # an earlier run's per-mode traceback.
+            failure.unlink(missing_ok=True)
+            mode_failure.unlink(missing_ok=True)
+            error_log.unlink(missing_ok=True)
             try:
                 with tempfile.TemporaryDirectory(prefix='pending-',dir=build) as pending:
                     argv=[str(directory),'--config',str(config_path),'--source-md',str(normalized),'--build-dir',str(build),'--out-dir',pending,'--math',mode]
@@ -128,12 +137,23 @@ def run(directory: Path, out_dir: Path | None = None, modes=None, overrides=None
                         audit=audit_png(candidate,cfg);mode_result['audit']=audit
                         validation['ok'] &= audit['ok']
                     # Retain current-run diagnostic per mode before the converter writes another one.
-                    failure=build/'failures.log'
-                    if failure.exists():shutil.copyfile(failure,build/f'failures.{mode}.log')
+                    if failure.exists():shutil.copyfile(failure,mode_failure)
                     if not validation['ok']:
                         mode_result['status']='failed'
+                        diagnostics=[
+                            f"{c['name']}: {c.get('detail','')}".rstrip()
+                            for c in validation['checks'] if not c['ok']
+                        ]
+                        diagnostics.extend(mode_result.get('audit',{}).get('errors',[]))
+                        if not diagnostics:diagnostics=['EPUB 验收未通过']
+                        mode_result['error']='；'.join(diagnostics[:3])
+                        existing=mode_failure.read_text() if mode_failure.exists() else ''
+                        detail='\n【构建/验收失败】\n'+'\n'.join(f'  - {x}' for x in diagnostics)+'\n'
+                        convert.atomic_text(mode_failure,existing.rstrip()+"\n"+detail)
                         for c in validation['checks']:
                             if not c['ok']:print('❌',c['name'],c['detail'])
+                        for detail in mode_result.get('audit',{}).get('errors',[]):
+                            print('❌ PNG audit',detail)
                     else:
                         destination=out/candidate.name
                         os.replace(candidate,destination)
@@ -142,7 +162,14 @@ def run(directory: Path, out_dir: Path | None = None, modes=None, overrides=None
                         warnings.extend(f'{mode}: {w}' for w in mode_result.get('audit',{}).get('warnings',[]))
             except Exception as exc:
                 mode_result.update(status='failed',error=str(exc))
-                convert.atomic_text(build/f'error.{mode}.log',traceback.format_exc())
+                trace=traceback.format_exc()
+                convert.atomic_text(error_log,trace)
+                convert.atomic_text(
+                    mode_failure,
+                    '【构建异常】\n'
+                    f'  - {type(exc).__name__}: {exc}\n'
+                    f'  - 完整堆栈：{error_log}\n',
+                )
                 print('❌',mode,str(exc),flush=True)
             report['modes'][mode]=mode_result
             write_json(build/'report.json',report)

@@ -221,6 +221,11 @@ def _preprocess_legacy(text: str, cfg: dict) -> str:
     text = text.replace("L\x00Hospital", "L'Hospital")
     text = re.sub(r"<(sub|sup)>\x00</\1>", "", text)
     text = _fix_nul_in_headers(text)
+    # Other OCR control-byte noise (BEL \x07, SO \x0e, etc.) crashes xmllint
+    # when it lands inside a prose paragraph. The wrapper's normalize step
+    # also leaves some of these through; strip them here so every book is
+    # safe. Keep \t, \n, \r.
+    text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     # Remaining strays are intra-token OCR noise ("有2\x00个子集", "f\x00(1)") —
     # drop them outright (headers were already space-fixed above).
     text = text.replace("\x00", "")
@@ -340,6 +345,8 @@ def preprocess(text: str, cfg: dict) -> str:
     for old, new in cfg.get("text_replacements", []):
         protected = protected.replace(old, new)
     protected = _fix_nul_in_headers(protected).replace("\x00", "")
+    # Strip OCR control-byte noise that xmllint rejects in prose.
+    protected = re.sub(r"[\x00-\x08\x0b-\x1f]", "", protected)
     protected = _normalize_inline_math(protected)
     protected = _apply_to_math(protected, _repair_latex)
     # Escape pseudo-tags such as a<b; legitimate HTML remains available.
@@ -841,11 +848,11 @@ _MARKER_MATH_LINE_RE = re.compile(
     r"^\s*(?P<mark>[（(]\s*[0-9a-zA-Z]+\s*[)）]|[0-9a-zA-Z]+[.、．)])\s*"
     r"⟂MATH[DI]:(?P<key>[0-9a-f]+)⟂\s*(?P<tail>[。．，,；;、：:）)】\].]*)\s*$"
 )
-# OCR sometimes splits an equation number from its formula across lines
-# ("(C)" alone, blank line, then the lone token). The bare marker alone is
-# parsed by pandoc as an EMPTY list item once the formula moves to a
-# display line - merge the pair first so the marker+formula re-flow
-# below consumes it as one unit.
+# OCR sometimes splits an equation number from its formula across lines.
+# The marker may precede the formula ("(C)", blank, token) or follow it
+# (token, blank, "(2)").  A bare marker is parsed by pandoc as an EMPTY list
+# item, so merge either ordering first and let the marker+formula re-flow
+# below consume it as one unit.
 _BARE_MARKER_RE = re.compile(
     r"^\s*(?P<mark>[（(]\s*[0-9a-zA-Z]+\s*[)）]|[0-9a-zA-Z]+[.、．)])\s*$"
 )
@@ -922,6 +929,19 @@ def _reflow_numbered_math_lines(
             if j < len(lines) and _LONE_TOKEN_RE.match(lines[j]):
                 pre.append(f"{mm['mark']} {lines[j].strip()}")
                 i = j + 1
+                continue
+            # The printed equation number can also be OCR'd after its
+            # formula.  Look past intervening blank lines already emitted,
+            # but only consume a lone math token: figure captions such as
+            # ``![](diagram.jpg)`` followed by ``(1)`` must stay untouched.
+            previous = len(pre) - 1
+            while previous >= 0 and not pre[previous].strip():
+                previous -= 1
+            if previous >= 0 and _LONE_TOKEN_RE.match(pre[previous]):
+                token = pre[previous].strip()
+                del pre[previous:]
+                pre.append(f"{mm['mark']} {token}")
+                i += 1
                 continue
         pre.append(lines[i])
         i += 1

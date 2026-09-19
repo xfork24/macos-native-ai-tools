@@ -48,6 +48,25 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(r"\text{(3)}", cleaned)
         self.assertEqual(convert.count_math(cleaned), (1, 0))
 
+    def test_equation_number_after_display_does_not_become_empty_list(self):
+        key = "a" * 40
+        source = f"before\n\n⟂MATHD:{key}⟂\n\n(2)\n\nafter"
+        jobs = {key: {"latex": "x=2", "display": True}}
+        reflowed, updated, new_keys = convert._reflow_numbered_math_lines(
+            source, jobs
+        )
+        self.assertEqual(len(new_keys), 1)
+        self.assertNotRegex(reflowed, r"(?m)^\s*\(2\)\s*$")
+        self.assertEqual(updated[new_keys[0]]["latex"], r"\text{(2)}\quad x=2")
+        xhtml = convert._md_fragment_to_xhtml(reflowed, "Test")
+        self.assertNotIn("<li></li>", xhtml)
+
+    def test_figure_caption_marker_is_not_merged_as_equation_number(self):
+        source = "![](images/figure.jpg)  \n(1)\n"
+        reflowed, _, new_keys = convert._reflow_numbered_math_lines(source, {})
+        self.assertEqual(new_keys, [])
+        self.assertEqual(reflowed, source)
+
     def test_missing_config_and_ambiguous_markdown_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
